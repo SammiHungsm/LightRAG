@@ -18,6 +18,8 @@ services:
       - ./config.ini:/app/config.ini
       - ./.env:/app/.env
       - ./data/mineru_models:/app/data/mineru_models
+      - ./data/financial_data.db:/app/data/financial_data.db
+      - ./data/output:/app/data/output
     env_file:
       - .env
     restart: unless-stopped

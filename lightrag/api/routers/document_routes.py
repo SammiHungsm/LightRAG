@@ -44,7 +44,7 @@ rag_pipeline = None
 if HAS_RAG_ADAPTER:
     rag_pipeline = RagAnythingPipeline(
         upload_dir="./inputs",
-        output_dir="./raganything_output",
+        output_dir="./output",
         sql_db_path="./financial_data.db"
     )
 
@@ -1835,20 +1835,14 @@ async def pipeline_index_texts(
 async def run_scanning_process(
     rag: LightRAG, doc_manager: DocumentManager, track_id: str = None
 ):
-    """Background task to scan and index documents
-
-    Args:
-        rag: LightRAG instance
-        doc_manager: DocumentManager instance
-        track_id: Optional tracking ID to pass to all scanned files
-    """
+    """Background task to scan and index documents"""
     try:
         new_files = doc_manager.scan_directory_for_new_files()
         total_files = len(new_files)
         logger.info(f"Found {total_files} files to index.")
 
         if new_files:
-            # Check for files with PROCESSED status and filter them out
+            # Filter out already processed files
             valid_files = []
             processed_files = []
 
@@ -1857,39 +1851,74 @@ async def run_scanning_process(
                 existing_doc_data = await rag.doc_status.get_doc_by_file_path(filename)
 
                 if existing_doc_data and existing_doc_data.get("status") == "processed":
-                    # File is already PROCESSED, skip it with warning
                     processed_files.append(filename)
                     logger.warning(f"Skipping already processed file: {filename}")
                 else:
-                    # File is new or in non-PROCESSED status, add to processing list
                     valid_files.append(file_path)
 
-            # Process valid files (new files + non-PROCESSED status files)
             if valid_files:
-                await pipeline_index_files(rag, valid_files, track_id)
+                # === 修改開始：分流邏輯 ===
+                standard_files = []
+                
+                for file_path in valid_files:
+                    # 判斷是否應該使用 RagAnything Pipeline (PDF + Adapter開啟)
+                    is_custom_pipeline = (
+                        file_path.suffix.lower() == ".pdf" 
+                        and HAS_RAG_ADAPTER 
+                        and rag_pipeline is not None
+                    )
+
+                    if is_custom_pipeline:
+                        logger.info(f"🔄 [Scan] Routing {file_path.name} to RagAnything Pipeline")
+                        try:
+                            # 1. 執行自定義 Pipeline (Step 1 & 2 & 3)
+                            await bg_process_pdf_pipeline(
+                                rag, 
+                                rag_pipeline, 
+                                file_path, 
+                                track_id
+                            )
+                            
+                            # 2. 成功後，手動將檔案移動到 __enqueued__ (防止下次重複掃描)
+                            # 因為 bg_process_pdf_pipeline 本身沒有寫移動檔案的邏輯，這裡要補上
+                            try:
+                                enqueued_dir = file_path.parent / "__enqueued__"
+                                enqueued_dir.mkdir(exist_ok=True)
+                                
+                                # 避免檔名衝突
+                                target_name = get_unique_filename_in_enqueued(enqueued_dir, file_path.name)
+                                target_path = enqueued_dir / target_name
+                                
+                                file_path.rename(target_path)
+                                logger.info(f"Moved processed file to: {target_name}")
+                                
+                            except Exception as move_err:
+                                logger.error(f"Failed to move file {file_path.name}: {move_err}")
+
+                        except Exception as e:
+                            logger.error(f"❌ [Scan] RagAnything failed for {file_path.name}: {e}")
+                            # 失敗的檔案不移動，下次 Scan 會重試
+                    else:
+                        # 不是 PDF 或沒有 Adapter，加入標準處理清單
+                        standard_files.append(file_path)
+                
+                # 3. 處理剩下的標準檔案 (txt, md, docx 等)
+                if standard_files:
+                    await pipeline_index_files(rag, standard_files, track_id)
+                
+                # === 修改結束 ===
+
                 if processed_files:
-                    logger.info(
-                        f"Scanning process completed: {len(valid_files)} files Processed {len(processed_files)} skipped."
-                    )
-                else:
-                    logger.info(
-                        f"Scanning process completed: {len(valid_files)} files Processed."
-                    )
+                    logger.info(f"Scanning process completed. Skipped {len(processed_files)} processed files.")
             else:
-                logger.info(
-                    "No files to process after filtering already processed files."
-                )
+                logger.info("No files to process after filtering already processed files.")
         else:
-            # No new files to index, check if there are any documents in the queue
-            logger.info(
-                "No upload file found, check if there are any documents in the queue..."
-            )
+            logger.info("No upload file found, checking queue...")
             await rag.apipeline_process_enqueue_documents()
 
     except Exception as e:
         logger.error(f"Error during scanning process: {str(e)}")
         logger.error(traceback.format_exc())
-
 
 async def background_delete_documents(
     rag: LightRAG,

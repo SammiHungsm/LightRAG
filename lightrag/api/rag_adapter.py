@@ -13,7 +13,25 @@ from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from loguru import logger
 from functools import partial
+import logging # 記得 import logging
 
+# === 新增這個 Class ===
+class InterceptHandler(logging.Handler):
+    def emit(self, record):
+        # 獲取對應的 Loguru Level
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+
+        # 找到正確的調用層級
+        frame, depth = logging.currentframe(), 2
+        while frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+
+        # 將 Log 轉發給 Loguru
+        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
 # === LightRAG Imports ===
 try:
     from lightrag import LightRAG
@@ -44,9 +62,15 @@ class RagAnythingPipeline:
         """
         self.upload_dir = Path(upload_dir)
         self.output_dir = Path(output_dir)
+        # [新增] 明確定義 Step 1 和 Step 2 的子目錄，對齊你現有的檔案結構
+        self.step1_dir = self.output_dir / "step1_vlm_output"
+        self.step2_dir = self.output_dir / "step2_output_granular"
+        # 建立這些子目錄
+        self.step1_dir.mkdir(parents=True, exist_ok=True)
+        self.step2_dir.mkdir(parents=True, exist_ok=True)
         self.sql_db_path = sql_db_path
         self.working_dir = working_dir
-        self.log_dir = Path("./logs")
+        self.log_dir = Path("./data/logs")
 
         # 1. Setup Directories
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -59,6 +83,13 @@ class RagAnythingPipeline:
         logger.add(sys.stderr, level="INFO") 
         logger.add(log_file, rotation="10 MB", level="DEBUG", encoding="utf-8")
         logger.info(f"📝 Pipeline Log file created: {log_file}")
+
+        # === [新增] 強制將 LightRAG (標準 logging) 的訊息轉發到 loguru ===
+        logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+        
+        # 額外確保 'lightrag' 的 logger 被設定為 INFO 或 DEBUG
+        logging.getLogger("lightrag").setLevel(logging.INFO)
+        logging.getLogger("httpx").setLevel(logging.WARNING) # 避免太吵
 
         # 3. Setup Azure OpenAI Client (For Step 2 Vision)
         self.azure_client = None
@@ -163,10 +194,11 @@ class RagAnythingPipeline:
     def _find_real_image_path(self, file_stem: str, rel_path: str) -> Optional[str]:
         if not rel_path: return None
         img_filename = os.path.basename(rel_path)
+        # [修正] 改用 self.step1_dir 來找圖片
         possible_paths = [
-            self.output_dir / file_stem / "auto" / "images" / img_filename,
-            self.output_dir / file_stem / "images" / img_filename,
-            self.output_dir / file_stem / img_filename
+            self.step1_dir / file_stem / "auto" / "images" / img_filename,
+            self.step1_dir / file_stem / "images" / img_filename,
+            self.step1_dir / file_stem / img_filename
         ]
         for p in possible_paths:
             if p.exists(): return str(p)
@@ -180,17 +212,20 @@ class RagAnythingPipeline:
         file_path_obj = Path(file_path)
         file_stem = file_path_obj.stem
         
-        expected_json = self.output_dir / file_stem / "auto" / f"{file_stem}_content_list.json"
+        # [修正] 改用 self.step1_dir 檢查檔案是否存在
+        expected_json = self.step1_dir / file_stem / "auto" / f"{file_stem}_content_list.json"
         if not expected_json.exists():
-            expected_json = self.output_dir / file_stem / "auto" / "content_list.json"
+            expected_json = self.step1_dir / file_stem / "auto" / "content_list.json"
 
         if expected_json.exists():
             logger.info(f"⚡ Skipping Mineru, output exists: {expected_json}")
             return str(expected_json)
 
         logger.info(f"🚀 [Step 1] Running Mineru OCR on {file_path_obj.name}...")
-        cmd = ["magic-pdf", "-p", str(file_path), "-o", str(self.output_dir), "-m", "auto"]
-
+        
+        # [修正] Magic-PDF 的輸出目錄也要指向 step1_dir
+        cmd = ["magic-pdf", "-p", str(file_path), "-o", str(self.step1_dir), "-m", "auto"]
+        
         def _run_subprocess():
             return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -202,7 +237,7 @@ class RagAnythingPipeline:
             
             logger.success(f"✅ Mineru finished processing {file_stem}")
             
-            json_files = list((self.output_dir / file_stem).rglob("*content_list.json"))
+            json_files = list((self.step1_dir / file_stem).rglob("*content_list.json"))
             if json_files:
                 return str(json_files[0])
             else:
@@ -319,6 +354,20 @@ class RagAnythingPipeline:
         conn.commit()
         conn.close()
         logger.success(f"✅ ETL Done. SQL Rows: {stats['sql']} | Chunks: {len(structured_chunks)}")
+        # [新增] 將結果存入 step2_output_granular 資料夾
+        if structured_chunks:
+            file_stem = Path(file_name).stem
+            output_subdir = self.step2_dir / file_stem
+            output_subdir.mkdir(parents=True, exist_ok=True)
+            
+            output_json_path = output_subdir / "granular_content.json"
+            try:
+                with open(output_json_path, "w", encoding="utf-8") as f:
+                    json.dump(structured_chunks, f, ensure_ascii=False, indent=2)
+                logger.info(f"💾 Step 2 output saved to: {output_json_path}")
+            except Exception as e:
+                logger.error(f"❌ Failed to save Step 2 JSON: {e}")
+                
         return structured_chunks
 
     # =========================================================================
@@ -394,7 +443,9 @@ if __name__ == "__main__":
         pipeline = RagAnythingPipeline(
             upload_dir="./data/input",
             output_dir="./data/output",
-            sql_db_path="./financial.db"
+            sql_db_path="./financial.db",
+            sql_db_path="./data/financial.db",
+            working_dir="./data/rag_storage"
         )
         logger.info("Pipeline initialized. Call process_document() to run.")
 
