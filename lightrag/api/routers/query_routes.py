@@ -3,16 +3,29 @@ This module contains all query-related routes for the LightRAG API.
 """
 
 import json
+import os
 from typing import Any, Dict, List, Literal, Optional
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, field_validator
+
+# LightRAG Imports
 from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import logger
-from pydantic import BaseModel, Field, field_validator
+
+# Config Import (Single Source of Truth)
+from lightrag.api.config import global_args 
+
+# Nanobot Imports
 from nanobot.agent.loop import AgentLoop
+from nanobot.bus.queue import MessageBus
+from nanobot.providers.litellm_provider import LiteLLMProvider
+from nanobot.agent.tools.base import Tool
 
 router = APIRouter(tags=["query"])
-
 
 class QueryRequest(BaseModel):
     query: str = Field(
@@ -143,7 +156,42 @@ class QueryRequest(BaseModel):
         param.stream = is_stream
         return param
 
+class LightRAGTool(Tool):
+    name = "search_knowledge_base"
+    description = """
+    The Knowledge Base containing annual reports and index compositions.
+    USAGE:
+    1. Find lists: "Hang Seng Biotech Index member list"
+    2. Find data: "Auditor of 6160 Beone"
+    """
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Specific search query."}
+        },
+        "required": ["query"]
+    }
 
+    def __init__(self, rag_instance, refs_list):
+        super().__init__()
+        self.rag = rag_instance
+        self.refs_list = refs_list
+
+    async def execute(self, query: str, **kwargs) -> str:
+        # 使用 mix 模式獲取最佳效果
+        param = QueryParam(mode="mix", stream=False, top_k=60)
+        try:
+            result = await self.rag.aquery_llm(query, param=param)
+            data = result.get("data", {})
+            if "references" in data:
+                self.refs_list.extend(data["references"])
+            
+            content = result.get("llm_response", {}).get("content", "")
+            return content if content else "No relevant data found."
+        except Exception as e:
+            logger.error(f"Tool Error: {e}")
+            return f"Error: {str(e)}"
+        
 class ReferenceItem(BaseModel):
     """A single reference item in query responses."""
 
@@ -189,7 +237,52 @@ class StreamChunkResponse(BaseModel):
     error: Optional[str] = Field(
         default=None, description="Error message if processing fails"
     )
+def _create_agent(rag, collected_refs: list) -> AgentLoop:
+    """Helper to initialize the Financial Research Agent"""
+    
+    # 1. Workspace
+    workspace_path = Path(global_args.working_dir) / "nanobot_workspace"
+    workspace_path.mkdir(parents=True, exist_ok=True)
 
+    # 2. Provider (From Config)
+    provider = LiteLLMProvider(
+        api_key=global_args.llm_binding_api_key,
+        api_base=global_args.llm_binding_host,
+        default_model=os.getenv("NANOBOT_MODEL", global_args.llm_model)
+    )
+
+    # 3. Agent Loop
+    agent = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=workspace_path,
+        max_iterations=15, # 允許足夠步驟進行 List -> Detail 查詢
+        restrict_to_workspace=True
+    )
+
+    # 4. System Prompt (The Brain)
+    agent.system_prompt = """
+    You are a Senior Financial Research Agent.
+    
+    PROTOCOL FOR "LIST ALL" REQUESTS:
+    1. **Discovery**: Use `search_knowledge_base` to find official lists (e.g., "Hang Seng Biotech Index constituents").
+    2. **Extraction**: Extract Stock Codes and Names.
+    3. **Execution**: Perform targeted searches for specific data (e.g., "Auditors", "Shareholders") for EACH company. Batch queries if needed.
+    4. **Reporting**: Present final answer in a Markdown table. Mark missing data as "N/A".
+    """
+
+    # 5. Register Tool
+    agent.tools.register(LightRAGTool(rag, collected_refs))
+    
+    return agent
+
+def _format_context(history: List[Dict[str, str]], query: str) -> str:
+    """Format chat history for the agent"""
+    if not history:
+        return query
+    
+    context_str = "\n".join([f"{m.get('role','U').upper()}: {m.get('content','')}" for m in history[-3:]])
+    return f"HISTORY:\n{context_str}\n\nCURRENT REQUEST:\n{query}"
 
 def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
     combined_auth = get_combined_auth_dependency(api_key)
@@ -403,156 +496,37 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
         try:
-            # =================================================================
-            # 🤖 [NANOBOT LAYER] Agent Execution
-            # =================================================================
-            user_query = request.query.strip()
-            logger.info(f"🤖 Nanobot Processing Query: {user_query}")
-
-            import os
-            from pathlib import Path
-            # Local imports to ensure availability within the function scope
-            from nanobot.agent.loop import AgentLoop
-            from nanobot.bus.queue import MessageBus
-            from nanobot.providers.litellm_provider import LiteLLMProvider
-            from nanobot.agent.tools.base import BaseTool
-            from lightrag.lightrag import QueryParam # Ensure we can create params
-
-            # 1. Define the Bridge Tool (Nanobot -> LightRAG)
-            class LightRAGTool(BaseTool):
-                name = "search_knowledge_base"
-                description = "Use this tool to search the knowledge base when you need information to answer the user's question."
-                parameters = {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The specific question or query to search for in the knowledge base."
-                        }
-                    },
-                    "required": ["query"]
-                }
-
-                def __init__(self, rag_instance, refs_list):
-                    super().__init__()
-                    self.rag = rag_instance
-                    self.refs_list = refs_list
-
-                async def execute(self, query: str, **kwargs) -> str:
-                    # Use 'mix' mode for best retrieval results
-                    # Force stream=False to get full response object
-                    param = QueryParam(mode="mix", stream=False)
-                    
-                    try:
-                        # Call the raw LightRAG engine
-                        result = await self.rag.aquery_llm(query, param=param)
-                        
-                        # Collect references for the final response
-                        data = result.get("data", {})
-                        if "references" in data:
-                            self.refs_list.extend(data["references"])
-                            
-                        # Return the answer generated by LightRAG to the Agent
-                        # The agent will use this info to formulate its final reply
-                        return result.get("llm_response", {}).get("content", "No information found.")
-                    except Exception as e:
-                        logger.error(f"LightRAG Tool Error: {e}")
-                        return f"Error querying knowledge base: {str(e)}"
-
-            # 2. Setup Agent Environment
-            # Workspace for Agent memory/files (Ensure directory exists)
-            workspace_path = Path("./rag_storage/nanobot_workspace")
-            workspace_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"🤖 Nanobot Request (Sync): {request.query}")
             
-            # Initialize Components
-            bus = MessageBus()
-            # Use environment model or default to a fast model
-            # Note: Ensure LITELMM env vars (like OPENAI_API_KEY) are set
-            provider = LiteLLMProvider(model=os.getenv("NANOBOT_MODEL", "gpt-4o-mini"))
-            
-            agent = AgentLoop(
-                bus=bus,
-                provider=provider,
-                workspace=workspace_path,
-                max_iterations=3, # Limit steps to keep response fast
-                restrict_to_workspace=True
-            )
-            
-            # 3. Register Tool
-            collected_references = [] # Store references found during execution
-            rag_tool = LightRAGTool(rag, collected_references)
-            agent.tools.register(rag_tool)
-            
-            # 4. Run Agent
-            logger.info("🤖 Agent started execution...")
+            # 1. 準備 Agent
+            collected_refs = []
+            agent = _create_agent(rag, collected_refs)
+            agent_input = _format_context(request.conversation_history, request.query)
+
+            # 2. 執行 Agent
             response_text = await agent.process_direct(
-                content=user_query,
+                content=agent_input,
                 channel="webui",
-                chat_id="user_session"
+                chat_id="user_session_sync"
             )
-            logger.info("🤖 Agent finished execution.")
 
-            # 5. Return Agent Response
-            # We return immediately, bypassing the original logic below
+            # 3. 整理 References (去重)
+            unique_refs = []
+            if request.include_references and collected_refs:
+                seen = set()
+                for ref in collected_refs:
+                    rid = ref.get('reference_id')
+                    if rid and rid not in seen:
+                        seen.add(rid)
+                        unique_refs.append(ref)
+
             return QueryResponse(
                 response=response_text,
-                references=collected_references if collected_references else None
+                references=unique_refs if unique_refs else None
             )
 
-            # =================================================================
-            # 🧠 [RAG LAYER] Original LightRAG Logic (Fallback / Legacy)
-            # =================================================================
-            # This logic is preserved as requested but is unreachable due to the return above.
-            
-            param = request.to_query_params(
-                False
-            )  # Ensure stream=False for non-streaming endpoint
-            # Force stream=False for /query endpoint regardless of include_references setting
-            param.stream = False
-
-            # Unified approach: always use aquery_llm for both cases
-            result = await rag.aquery_llm(request.query, param=param)
-
-            # Extract LLM response and references from unified result
-            llm_response = result.get("llm_response", {})
-            data = result.get("data", {})
-            references = data.get("references", [])
-
-            # Get the non-streaming response content
-            response_content = llm_response.get("content", "")
-            if not response_content:
-                response_content = "No relevant context found for the query."
-
-            # Enrich references with chunk content if requested
-            if request.include_references and request.include_chunk_content:
-                chunks = data.get("chunks", [])
-                # Create a mapping from reference_id to chunk content
-                ref_id_to_content = {}
-                for chunk in chunks:
-                    ref_id = chunk.get("reference_id", "")
-                    content = chunk.get("content", "")
-                    if ref_id and content:
-                        # Collect chunk content; join later to avoid quadratic string concatenation
-                        ref_id_to_content.setdefault(ref_id, []).append(content)
-
-                # Add content to references
-                enriched_references = []
-                for ref in references:
-                    ref_copy = ref.copy()
-                    ref_id = ref.get("reference_id", "")
-                    if ref_id in ref_id_to_content:
-                        # Keep content as a list of chunks (one file may have multiple chunks)
-                        ref_copy["content"] = ref_id_to_content[ref_id]
-                    enriched_references.append(ref_copy)
-                references = enriched_references
-
-            # Return response with or without references based on request
-            if request.include_references:
-                return QueryResponse(response=response_content, references=references)
-            else:
-                return QueryResponse(response=response_content, references=None)
         except Exception as e:
-            logger.error(f"Error processing query: {str(e)}", exc_info=True)
+            logger.error(f"Query Error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
         
     @router.post(
@@ -762,84 +736,55 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             Use streaming mode for real-time interfaces and non-streaming for batch processing.
         """
         try:
-            # Use the stream parameter from the request, defaulting to True if not specified
-            stream_mode = request.stream if request.stream is not None else True
-            param = request.to_query_params(stream_mode)
+            logger.info(f"🤖 Nanobot Request (Stream): {request.query}")
 
-            from fastapi.responses import StreamingResponse
+            # 1. 建立 Agent (重用邏輯)
+            collected_refs = []
+            agent = _create_agent(rag, collected_refs)
+            agent_input = _format_context(request.conversation_history, request.query)
 
-            # Unified approach: always use aquery_llm for all cases
-            result = await rag.aquery_llm(request.query, param=param)
+            # 2. 執行 Agent
+            response_text = await agent.process_direct(
+                content=agent_input,
+                channel="webui",
+                chat_id="user_session_stream"
+            )
 
-            async def stream_generator():
-                # Extract references and LLM response from unified result
-                references = result.get("data", {}).get("references", [])
-                llm_response = result.get("llm_response", {})
-
-                # Enrich references with chunk content if requested
-                if request.include_references and request.include_chunk_content:
-                    data = result.get("data", {})
-                    chunks = data.get("chunks", [])
-                    # Create a mapping from reference_id to chunk content
-                    ref_id_to_content = {}
-                    for chunk in chunks:
-                        ref_id = chunk.get("reference_id", "")
-                        content = chunk.get("content", "")
-                        if ref_id and content:
-                            # Collect chunk content
-                            ref_id_to_content.setdefault(ref_id, []).append(content)
-
-                    # Add content to references
-                    enriched_references = []
-                    for ref in references:
-                        ref_copy = ref.copy()
-                        ref_id = ref.get("reference_id", "")
-                        if ref_id in ref_id_to_content:
-                            # Keep content as a list of chunks (one file may have multiple chunks)
-                            ref_copy["content"] = ref_id_to_content[ref_id]
-                        enriched_references.append(ref_copy)
-                    references = enriched_references
-
-                if llm_response.get("is_streaming"):
-                    # Streaming mode: send references first, then stream response chunks
-                    if request.include_references:
-                        yield f"{json.dumps({'references': references})}\n"
-
-                    response_stream = llm_response.get("response_iterator")
-                    if response_stream:
-                        try:
-                            async for chunk in response_stream:
-                                if chunk:  # Only send non-empty content
-                                    yield f"{json.dumps({'response': chunk})}\n"
-                        except Exception as e:
-                            logger.error(f"Streaming error: {str(e)}")
-                            yield f"{json.dumps({'error': str(e)})}\n"
-                else:
-                    # Non-streaming mode: send complete response in one message
-                    response_content = llm_response.get("content", "")
-                    if not response_content:
-                        response_content = "No relevant context found for the query."
-
-                    # Create complete response object
-                    complete_response = {"response": response_content}
-                    if request.include_references:
-                        complete_response["references"] = references
-
-                    yield f"{json.dumps(complete_response)}\n"
+            # 3. Generator for NDJSON Response
+            async def response_generator():
+                # 先回傳 References (第一行)
+                if collected_refs and request.include_references:
+                    seen = set()
+                    unique_refs = []
+                    for ref in collected_refs:
+                        rid = ref.get('reference_id')
+                        if rid and rid not in seen:
+                            seen.add(rid)
+                            unique_refs.append(ref)
+                    
+                    if unique_refs:
+                        yield f"{json.dumps({'references': unique_refs})}\n"
+                
+                # 再回傳 Response (第二行)
+                yield f"{json.dumps({'response': response_text})}\n"
 
             return StreamingResponse(
-                stream_generator(),
+                response_generator(),
                 media_type="application/x-ndjson",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "Content-Type": "application/x-ndjson",
-                    "X-Accel-Buffering": "no",  # Ensure proper handling of streaming response when proxied by Nginx
+                    "X-Accel-Buffering": "no",
                 },
             )
+
         except Exception as e:
-            logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error(f"Stream Error: {e}", exc_info=True)
+            # 回傳 NDJSON 格式的錯誤訊息
+            return StreamingResponse(
+                iter([f"{json.dumps({'error': str(e)})}\n"]),
+                media_type="application/x-ndjson"
+            )
 
     @router.post(
         "/query/data",

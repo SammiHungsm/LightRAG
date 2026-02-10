@@ -8,7 +8,7 @@ dynamic = ["version"]
 authors = [
     {name = "Zirui Guo"}
 ]
-description = "LightRAG: Simple and Fast Retrieval-Augmented Generation"
+description = "LightRAG: Simple and Fast Retrieval-Augmented Generation (Integrated with Nanobot)"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10, <3.13"
@@ -21,6 +21,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    # --- LightRAG 核心依賴 ---
     "aiohttp",
     "configparser",
     "google-api-core>=2.0.0,<3.0.0",
@@ -40,6 +41,17 @@ dependencies = [
     "tiktoken",
     "xlsxwriter>=3.1.0",
     "raganything @ git+https://github.com/SammiHungsm/RAG-Anything.git",
+
+    # --- Nanobot 核心依賴 (新增部分) ---
+    "litellm",          # Nanobot 的 LLM Provider 核心
+    "loguru",           # Nanobot 的 Logging 系統
+    "typer",            # CLI 命令列工具
+    "rich",             # CLI 美化輸出
+    "croniter",         # CronTool 排程計算
+    "beautifulsoup4",   # WebFetchTool 網頁解析
+    "markdownify",      # 將網頁轉為 Markdown 俾 LLM 讀
+    "duckduckgo-search",# WebSearchTool (如果有的話)
+    "pyyaml",           # 處理 Config 檔案
 ]
 
 [project.optional-dependencies]
@@ -58,7 +70,7 @@ api = [
     "json_repair",
     "nano-vectordb",
     "networkx",
-    "numpy>=1.24.0,<2.0.0",  # 保持一致
+    "numpy>=1.24.0,<2.0.0",
     "openai>=2.0.0,<3.0.0",
     "pandas>=2.0.0,<2.4.0",
     "pipmaster",
@@ -87,24 +99,19 @@ api = [
     "pytz",
     "uvicorn",
     "gunicorn",
-    # Document processing dependencies (required for API document upload functionality)
-    "openpyxl>=3.0.0,<4.0.0",       # XLSX processing
-    "pycryptodome>=3.0.0,<4.0.0",   # PDF encryption support
-    "pypdf>=6.1.0",                 # PDF processing
-    "python-docx>=0.8.11,<2.0.0",   # DOCX processing
-    "python-pptx>=0.6.21,<2.0.0",   # PPTX processing
+    # Document processing dependencies
+    "openpyxl>=3.0.0,<4.0.0",
+    "pycryptodome>=3.0.0,<4.0.0",
+    "pypdf>=6.1.0",
+    "python-docx>=0.8.11,<2.0.0",
+    "python-pptx>=0.6.21,<2.0.0",
 ]
 
-# Advanced document processing engine (optional)
 docling = [
-    # On macOS, pytorch and frameworks use Objective-C are not fork-safe,
-    # and not compatible to gunicorn multi-worker mode
     "docling>=2.0.0,<3.0.0; sys_platform != 'darwin'",
 ]
 
-# Offline deployment dependencies (layered design for flexibility)
 offline-storage = [
-    # Storage backend dependencies
     "redis>=5.0.0,<8.0.0",
     "neo4j>=5.0.0,<7.0.0",
     "pymilvus>=2.6.2,<3.0.0",
@@ -115,21 +122,19 @@ offline-storage = [
 ]
 
 offline-llm = [
-    # LLM provider dependencies
     "openai>=2.0.0,<3.0.0",
     "anthropic>=0.18.0,<1.0.0",
     "ollama>=0.1.0,<1.0.0",
     "zhipuai>=2.0.0,<3.0.0",
     "aioboto3>=12.0.0,<16.0.0",
     "voyageai>=0.2.0,<1.0.0",
-    "llama-index>=0.14.0,<1.0.0",   # Updated to ensure compatibility with openai 2.x
-    "llama-index-llms-openai>=0.6.12",  # Explicitly require version that supports openai 2.x
+    "llama-index>=0.14.0,<1.0.0",
+    "llama-index-llms-openai>=0.6.12",
     "google-api-core>=2.0.0,<3.0.0",
     "google-genai>=1.0.0,<2.0.0",
 ]
 
 offline = [
-    # Complete offline package (includes api for document processing, plus storage and LLM)
     "lightrag-hku[api,offline-storage,offline-llm]",
 ]
 
@@ -148,7 +153,6 @@ evaluation = [
 ]
 
 observability = [
-    # LLM observability and tracing dependencies
     "langfuse>=3.8.1",
 ]
 
@@ -157,6 +161,8 @@ lightrag-server = "lightrag.api.lightrag_server:main"
 lightrag-gunicorn = "lightrag.api.run_with_gunicorn:main"
 lightrag-download-cache = "lightrag.tools.download_cache:main"
 lightrag-clean-llmqc = "lightrag.tools.clean_llm_query_cache:main"
+# [新增] 讓你可以直接用 nanobot 指令 (如果有需要)
+nanobot = "nanobot.cli.commands:app" 
 
 [project.urls]
 Homepage = "https://github.com/HKUDS/LightRAG"
@@ -165,7 +171,8 @@ Repository = "https://github.com/HKUDS/LightRAG"
 "Bug Tracker" = "https://github.com/HKUDS/LightRAG/issues"
 
 [tool.setuptools.packages.find]
-include = ["lightrag*"]
+# [重要] 這裡要 include nanobot，否則 install 時會忽略它
+include = ["lightrag*", "nanobot*"]
 exclude = ["data*", "tests*", "scripts*", "examples*", "dickens*", "reproduce*", "output_complete*", "rag_storage*", "inputs*"]
 
 [tool.setuptools]

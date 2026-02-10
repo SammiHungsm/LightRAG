@@ -33,6 +33,7 @@ ENV PATH="/root/.cargo/bin:/root/.local/bin:${PATH}"
 RUN mkdir -p /root/.local/share/uv
 
 # 複製依賴定義
+# [重要提示] 請確保你的 pyproject.toml 已經合併了 nanobot 和 lightrag 的所有依賴
 COPY pyproject.toml .
 COPY setup.py .
 COPY uv.lock .
@@ -43,6 +44,8 @@ RUN --mount=type=cache,target=/root/.local/share/uv \
 
 # 複製源代碼
 COPY lightrag/ ./lightrag/
+# [新增] 複製 Nanobot 源代碼，以便 LightRAG 可以 import 它
+COPY nanobot/ ./nanobot/
 COPY --from=frontend-builder /app/lightrag/api/webui ./lightrag/api/webui
 
 # 再次 Sync 確保環境完整
@@ -75,11 +78,15 @@ ENV UV_SYSTEM_PYTHON=1
 COPY --from=builder /root/.local /root/.local
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/lightrag ./lightrag
+# [新增] 將編譯階段複製好的 Nanobot 放入 Runtime
+COPY --from=builder /app/nanobot ./nanobot
 COPY pyproject.toml .
 COPY setup.py .
 COPY uv.lock .
 
 ENV PATH=/app/.venv/bin:/root/.local/bin:$PATH
+# [新增] 確保 Python 能夠在 /app 目錄下找到 nanobot 包
+ENV PYTHONPATH=/app
 
 # 建立數據目錄
 RUN mkdir -p /app/data/rag_storage /app/data/inputs /app/data/tiktoken \

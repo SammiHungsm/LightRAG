@@ -1,452 +1,287 @@
 import os
 import json
-import time
-import sys
 import asyncio
 import base64
 import sqlite3
 import subprocess
-import shutil
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
-from loguru import logger
-from functools import partial
-import logging # 記得 import logging
 
-# === 新增這個 Class ===
-class InterceptHandler(logging.Handler):
-    def emit(self, record):
-        # 獲取對應的 Loguru Level
-        try:
-            level = logger.level(record.levelname).name
-        except ValueError:
-            level = record.levelno
+from lightrag.utils import logger, EmbeddingFunc
+from lightrag import LightRAG
 
-        # 找到正確的調用層級
-        frame, depth = logging.currentframe(), 2
-        while frame.f_code.co_filename == logging.__file__:
-            frame = frame.f_back
-            depth += 1
-
-        # 將 Log 轉發給 Loguru
-        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
-# === LightRAG Imports ===
+# 1. 嘗試從 config 引入全域設定 (支援 Module 或 Script 執行)
 try:
-    from lightrag import LightRAG
-    from lightrag.utils import EmbeddingFunc
-    from lightrag.llm.openai import azure_openai_complete, openai_embed
+    from .config import global_args
 except ImportError:
-    logger.error("❌ Critical: lightrag.py not found or dependencies missing.")
-    raise
+    from config import global_args
 
-# Force load .env
+# 動態引入 OpenAI/Azure 函數，如果無安裝 Azure 庫都不會報錯
+from lightrag.llm.openai import openai_complete, openai_embed
+try:
+    from lightrag.llm.azure_openai import azure_openai_complete, azure_openai_embed
+except ImportError:
+    pass
+
 load_dotenv()
 
-# ==============================================================================
-# Helper: Async Wrapper for Azure Embedding
-# ==============================================================================
-async def embedding_func_wrapper(texts: list[str]) -> np.ndarray:
-    return await openai_embed.func(
-        texts=texts,
-        model=os.getenv("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-3-small"),
-        api_key=os.getenv("LLM_BINDING_API_KEY"),
-        base_url=os.getenv("LLM_BINDING_HOST"),
-    )
-
 class RagAnythingPipeline:
-    def __init__(self, upload_dir: str, output_dir: str, sql_db_path: str, working_dir: str = "./rag_storage"):
-        """
-        Initialize the RagAnything Pipeline with integrated Logging, OCR, ETL, and LightRAG.
-        """
+    def __init__(self, upload_dir: str, output_dir: str, sql_db_path: str, working_dir: str = "./rag_storage", rag_instance=None):
         self.upload_dir = Path(upload_dir)
         self.output_dir = Path(output_dir)
-        # [新增] 明確定義 Step 1 和 Step 2 的子目錄，對齊你現有的檔案結構
         self.step1_dir = self.output_dir / "step1_vlm_output"
         self.step2_dir = self.output_dir / "step2_output_granular"
-        # 建立這些子目錄
-        self.step1_dir.mkdir(parents=True, exist_ok=True)
-        self.step2_dir.mkdir(parents=True, exist_ok=True)
         self.sql_db_path = sql_db_path
         self.working_dir = working_dir
-        self.log_dir = Path("./data/logs")
 
-        # 1. Setup Directories
-        self.upload_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        for p in [self.upload_dir, self.output_dir, self.step1_dir, self.step2_dir]:
+            p.mkdir(parents=True, exist_ok=True)
 
-        # 2. Setup Logging
-        log_file = self.log_dir / f"rag_pipeline_{time.strftime('%Y%m%d_%H%M%S')}.log"
-        logger.remove() 
-        logger.add(sys.stderr, level="INFO") 
-        logger.add(log_file, rotation="10 MB", level="DEBUG", encoding="utf-8")
-        logger.info(f"📝 Pipeline Log file created: {log_file}")
-
-        # === [新增] 強制將 LightRAG (標準 logging) 的訊息轉發到 loguru ===
-        logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
-        
-        # 額外確保 'lightrag' 的 logger 被設定為 INFO 或 DEBUG
-        logging.getLogger("lightrag").setLevel(logging.INFO)
-        logging.getLogger("httpx").setLevel(logging.WARNING) # 避免太吵
-
-        # 3. Setup Azure OpenAI Client (For Step 2 Vision)
-        self.azure_client = None
-        self.azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-        self._init_azure_client()
-
-        # 4. Setup Database
+        # 2. Vision Client 改用 global_args 讀取設定
+        self.azure_client = self._init_vision_client()
         self._init_db()
 
-        # 5. Placeholder for LightRAG
-        self.rag = None
+        self.rag = rag_instance
+        if self.rag:
+            logger.info("✅ Pipeline initialized with injected LightRAG instance.")
 
-    def _init_azure_client(self):
-        try:
-            from openai import AzureOpenAI
-            api_key = os.getenv("LLM_BINDING_API_KEY")
-            endpoint = os.getenv("LLM_BINDING_HOST")
-            api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+    def _init_vision_client(self):
+        """利用 global_args 建立 Vision Client，減少重複代碼"""
+        api_key = global_args.llm_binding_api_key
+        endpoint = global_args.llm_binding_host
+        # Vision Deployment 可能與 Chat 不同，這裡保留彈性讀取 env，否則 fallback 到預設 model
+        self.vision_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", global_args.llm_model)
 
-            if api_key and endpoint:
-                self.azure_client = AzureOpenAI(
-                    api_key=api_key,
-                    api_version=api_version,
-                    azure_endpoint=endpoint
-                )
-                logger.info(f"✅ Azure OpenAI Enabled for Vision (Deployment: {self.azure_deployment})")
-            else:
-                logger.warning("⚠️ Azure Env Vars missing. Vision features disabled.")
-        except ImportError:
-            logger.warning("⚠️ 'openai' package not found. Vision features disabled.")
+        if api_key and endpoint:
+            try:
+                from openai import AzureOpenAI
+                if "openai/v1" in endpoint: endpoint = endpoint.split("/openai/v1")[0]
+                return AzureOpenAI(api_key=api_key, api_version="2024-02-15-preview", azure_endpoint=endpoint)
+            except ImportError:
+                logger.warning("⚠️ 'openai' package missing.")
+        return None
 
     def _init_db(self):
+        """保留你的專屬 DB Schema"""
         try:
-            conn = sqlite3.connect(self.sql_db_path)
-            cursor = conn.cursor()
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS financial_metrics (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    company_code TEXT,
-                    report_year INTEGER,
-                    metric_name TEXT,
-                    metric_value REAL,
-                    unit TEXT,
-                    source_file TEXT,
-                    page_number INTEGER,
-                    extraction_method TEXT,
-                    original_text TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            conn.commit()
-            conn.close()
+            with sqlite3.connect(self.sql_db_path) as conn:
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS financial_metrics (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        company_code TEXT, report_year INTEGER, metric_name TEXT,
+                        metric_value REAL, unit TEXT, source_file TEXT, page_number INTEGER,
+                        original_text TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
         except Exception as e:
-            logger.error(f"❌ Database initialization failed: {e}")
+            logger.error(f"❌ DB Init failed: {e}")
 
     async def initialize_rag(self):
-        """
-        Async initialization for LightRAG.
-        """
-        if self.rag:
-            return
+        """Standalone 模式下，根據 global_args 動態啟動 LightRAG"""
+        if self.rag: return
 
-        logger.info("🚀 Initializing LightRAG...")
+        logger.info("🚀 Initializing Standalone LightRAG (Dynamic Config)...")
+        binding = global_args.llm_binding
+        
+        # 3. 動態決定 LLM Function (不 Hardcode)
+        if binding == "azure_openai":
+            llm_func = azure_openai_complete
+            embed_func_core = azure_openai_embed
+        else:
+            llm_func = openai_complete
+            embed_func_core = openai_embed
+
+        # 4. 動態 Embedding Wrapper
+        async def dynamic_embedding_wrapper(texts: list[str]) -> np.ndarray:
+            return await embed_func_core.func(
+                texts=texts,
+                model=global_args.embedding_model, 
+                api_key=global_args.embedding_binding_api_key or global_args.llm_binding_api_key,
+                base_url=global_args.embedding_binding_host or global_args.llm_binding_host,
+            )
+
         try:
             self.rag = LightRAG(
                 working_dir=self.working_dir,
-                llm_model_func=azure_openai_complete, 
+                llm_model_func=llm_func,
+                llm_model_name=global_args.llm_model,
                 embedding_func=EmbeddingFunc(
-                    embedding_dim=int(os.getenv("EMBEDDING_DIM", "1536")),
+                    embedding_dim=global_args.embedding_dim or 1536,
                     max_token_size=8192,
-                    func=embedding_func_wrapper
+                    func=dynamic_embedding_wrapper
                 ),
-                chunk_token_size=512,
-                chunk_overlap_token_size=50,
-                default_llm_timeout=300
+                chunk_token_size=global_args.chunk_size,
+                chunk_overlap_token_size=global_args.chunk_overlap_size,
             )
             await self.rag.initialize_storages()
-            logger.success("✅ LightRAG Initialized Successfully")
+            logger.success(f"✅ LightRAG Initialized using binding: {binding}")
         except Exception as e:
-            logger.error(f"❌ Failed to initialize LightRAG: {e}")
+            logger.error(f"❌ LightRAG Init Failed: {e}")
             raise e
 
-    # =========================================================================
-    # Helpers
-    # =========================================================================
-
+    # === Helpers (精簡邏輯) ===
     def _encode_image(self, image_path: str) -> Optional[str]:
         if not os.path.exists(image_path): return None
-        with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+        with open(image_path, "rb") as f: return base64.b64encode(f.read()).decode('utf-8')
 
     def _get_safe_content(self, item: Dict) -> str:
-        candidates = [item.get("text"), item.get("content"), item.get("table_body")]
-        caption = item.get("image_caption") or item.get("table_caption")
-        if isinstance(caption, list): caption = "".join(caption)
-        if caption: candidates.append(caption)
-        
-        for c in candidates:
-            if c and str(c).strip(): return str(c).strip()
+        for k in ["text", "content", "table_body", "image_caption", "table_caption"]:
+            val = item.get(k)
+            if isinstance(val, list): val = "".join(val)
+            if val and str(val).strip(): return str(val).strip()
         return ""
 
     def _find_real_image_path(self, file_stem: str, rel_path: str) -> Optional[str]:
         if not rel_path: return None
-        img_filename = os.path.basename(rel_path)
-        # [修正] 改用 self.step1_dir 來找圖片
-        possible_paths = [
-            self.step1_dir / file_stem / "auto" / "images" / img_filename,
-            self.step1_dir / file_stem / "images" / img_filename,
-            self.step1_dir / file_stem / img_filename
-        ]
-        for p in possible_paths:
+        img_name = os.path.basename(rel_path)
+        for sub in ["auto/images", "images", ""]:
+            p = self.step1_dir / file_stem / sub / img_name
             if p.exists(): return str(p)
         return None
 
-    # =========================================================================
-    # Step 1: Async Mineru OCR
-    # =========================================================================
-
+    # === Step 1: Mineru OCR ===
     async def run_mineru_extraction(self, file_path: str) -> str:
-        file_path_obj = Path(file_path)
-        file_stem = file_path_obj.stem
+        fpath = Path(file_path)
+        fstem = fpath.stem
         
-        # [修正] 改用 self.step1_dir 檢查檔案是否存在
-        expected_json = self.step1_dir / file_stem / "auto" / f"{file_stem}_content_list.json"
-        if not expected_json.exists():
-            expected_json = self.step1_dir / file_stem / "auto" / "content_list.json"
+        possible_json = [
+            self.step1_dir / fstem / "auto" / f"{fstem}_content_list.json",
+            self.step1_dir / fstem / "auto" / "content_list.json"
+        ]
+        for p in possible_json:
+            if p.exists():
+                logger.info(f"⚡ Output exists: {p}")
+                return str(p)
 
-        if expected_json.exists():
-            logger.info(f"⚡ Skipping Mineru, output exists: {expected_json}")
-            return str(expected_json)
-
-        logger.info(f"🚀 [Step 1] Running Mineru OCR on {file_path_obj.name}...")
+        logger.info(f"🚀 Running Mineru on {fpath.name}...")
+        cmd = ["magic-pdf", "-p", str(fpath), "-o", str(self.step1_dir), "-m", "auto"]
         
-        # [修正] Magic-PDF 的輸出目錄也要指向 step1_dir
-        cmd = ["magic-pdf", "-p", str(file_path), "-o", str(self.step1_dir), "-m", "auto"]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
         
-        def _run_subprocess():
-            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            logger.error(f"❌ Mineru Error: {stderr.decode()}")
+            raise Exception("Mineru Failed")
 
-        try:
-            result = await asyncio.to_thread(_run_subprocess)
-            if result.returncode != 0:
-                 logger.error(f"❌ Mineru Error: {result.stderr}")
-                 raise Exception(f"Mineru Failed: {result.stderr}")
-            
-            logger.success(f"✅ Mineru finished processing {file_stem}")
-            
-            json_files = list((self.step1_dir / file_stem).rglob("*content_list.json"))
-            if json_files:
-                return str(json_files[0])
-            else:
-                raise FileNotFoundError(f"Mineru ran but generated no JSON for {file_stem}")
+        for p in possible_json:
+             if p.exists(): return str(p)
+        
+        found = list((self.step1_dir / fstem).rglob("*content_list.json"))
+        if found: return str(found[0])
+        raise FileNotFoundError(f"Mineru generated no JSON for {fstem}")
 
-        except Exception as e:
-            logger.error(f"❌ OCR Step Failed: {e}")
-            raise e
-
-    # =========================================================================
-    # Step 2: Async ETL (Vision + SQL)
-    # =========================================================================
-
-    async def _call_vision_llm(self, img_path: str, mode: str = "table", context_text: str = "") -> Optional[str]:
+    # === Step 2: Vision ETL (保留邏輯，簡化調用) ===
+    async def _call_vision_llm(self, img_path: str, mode: str = "table", context="" ) -> Optional[str]:
         if not self.azure_client: return None
-        
-        base64_image = await asyncio.to_thread(self._encode_image, img_path)
-        if not base64_image: return None
+        b64_img = await asyncio.to_thread(self._encode_image, img_path)
+        if not b64_img: return None
 
-        system_prompt = "You are a Financial Data Extractor." if mode == "table" else "Describe this image for RAG."
-        user_msg = f"Context: {context_text}\nExtract data."
-
+        sys_prompt = "You are a Financial Data Extractor." if mode == "table" else "Describe for RAG."
         try:
-            def _api_call():
-                return self.azure_client.chat.completions.create(
-                    model=self.azure_deployment,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": user_msg},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                        ]}
-                    ],
-                    temperature=0.1, max_tokens=2048,
-                    response_format={"type": "json_object"} if mode == "table" else None
-                )
-
-            response = await asyncio.to_thread(_api_call)
-            return response.choices[0].message.content.strip()
-
+            resp = await asyncio.to_thread(
+                self.azure_client.chat.completions.create,
+                model=self.vision_deployment,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": f"Context: {context}\nExtract data."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                    ]}
+                ],
+                temperature=0.1, max_tokens=2048,
+                response_format={"type": "json_object"} if mode == "table" else None
+            )
+            return resp.choices[0].message.content.strip()
         except Exception as e:
-            logger.error(f"❌ Vision LLM Failed: {e}")
+            logger.error(f"❌ Vision LLM Error: {e}")
             return None
 
     async def run_hybrid_etl(self, json_path: str, file_name: str) -> List[Dict[str, Any]]:
-        logger.info(f"🚀 [Step 2] Starting Hybrid ETL for {file_name}")
+        logger.info(f"🚀 Starting Hybrid ETL: {file_name}")
+        with open(json_path, 'r', encoding='utf-8') as f: content_list = json.load(f)
         
-        with open(json_path, 'r', encoding='utf-8') as f:
-            content_list = json.load(f)
-
-        file_stem = Path(file_name).stem
-        structured_chunks = []
-        stats = {"sql": 0, "text": 0, "table": 0}
-
-        conn = sqlite3.connect(self.sql_db_path)
-        cursor = conn.cursor()
-
-        # 🔥 暫定優先級為預設值，未來可透過參數傳入
-        default_priority = "NORMAL"
-
+        fstem = Path(file_name).stem
+        chunks = []
+        sql_buffer = [] 
+        
         for idx, item in enumerate(content_list):
-            item_type = item.get('type', 'text')
-            page_idx = item.get('page_idx', 0)
+            itype = item.get('type', 'text')
             content = self._get_safe_content(item)
-            
-            context_text = ""
-            if idx > 0:
-                prev = self._get_safe_content(content_list[idx-1])
-                context_text = prev[-200:]
+            img_path = self._find_real_image_path(fstem, item.get('img_path', ''))
+            prev_ctx = self._get_safe_content(content_list[idx-1])[-200:] if idx > 0 else ""
 
-            rel_path = item.get('img_path', '')
-            abs_img_path = self._find_real_image_path(file_stem, rel_path)
+            if itype in ['table', 'tabular', 'image', 'figure'] and img_path and self.azure_client:
+                mode = "table" if "table" in itype else "caption"
+                ai_res = await self._call_vision_llm(img_path, mode, prev_ctx)
+                if ai_res:
+                    content = f"{content}\n\n[AI Analysis]: {ai_res}"
+                    if mode == "table":
+                        try:
+                            metrics = json.loads(ai_res).get("metrics", [])
+                            for m in metrics:
+                                sql_buffer.append((
+                                    "Unknown", 2024, m.get('metric_name'), m.get('value'), 
+                                    m.get('unit'), file_name, item.get('page_idx', 0), str(m)
+                                ))
+                        except: pass
 
-            final_text_content = content
-            
-            # Metadata Construction
-            chunk_metadata = {
-                "source": file_name,
-                "page": page_idx,
-                "type": item_type,
-                "priority": default_priority # 👈 這裡全部統一為 NORMAL，不看類型
-            }
+            if content:
+                chunks.append({
+                    "content": content,
+                    "metadata": {"source": file_name, "page": item.get('page_idx', 0), "type": itype, "priority": "NORMAL"}
+                })
 
-            if item_type in ['table', 'tabular', 'image', 'figure']:
-                if abs_img_path and self.azure_client:
-                    mode = "table" if item_type in ['table', 'tabular'] else "caption"
-                    ai_result = await self._call_vision_llm(abs_img_path, mode=mode, context_text=context_text)
-                    
-                    if ai_result:
-                        final_text_content = f"{content}\n\n[AI Analysis]: {ai_result}"
-                        if mode == "table" and "metrics" in ai_result:
-                            try:
-                                data = json.loads(ai_result)
-                                if "metrics" in data:
-                                    for m in data["metrics"]:
-                                        cursor.execute("""
-                                            INSERT INTO financial_metrics 
-                                            (company_code, report_year, metric_name, metric_value, unit, source_file, page_number, original_text)
-                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                        """, ("Unknown", 2024, m.get('metric_name'), m.get('value'), m.get('unit'), file_name, page_idx, str(m)))
-                                        stats["sql"] += 1
-                            except: pass
-                stats["table"] += 1
-            else:
-                stats["text"] += 1
+        # 批量插入 SQL (比舊版更快更簡潔)
+        if sql_buffer:
+            with sqlite3.connect(self.sql_db_path) as conn:
+                conn.executemany("""
+                    INSERT INTO financial_metrics (company_code, report_year, metric_name, metric_value, unit, source_file, page_number, original_text)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, sql_buffer)
 
-            if final_text_content:
-                chunk_obj = {
-                    "content": final_text_content,
-                    "metadata": chunk_metadata 
-                }
-                structured_chunks.append(chunk_obj)
-
-        conn.commit()
-        conn.close()
-        logger.success(f"✅ ETL Done. SQL Rows: {stats['sql']} | Chunks: {len(structured_chunks)}")
-        # [新增] 將結果存入 step2_output_granular 資料夾
-        if structured_chunks:
-            file_stem = Path(file_name).stem
-            output_subdir = self.step2_dir / file_stem
-            output_subdir.mkdir(parents=True, exist_ok=True)
-            
-            output_json_path = output_subdir / "granular_content.json"
-            try:
-                with open(output_json_path, "w", encoding="utf-8") as f:
-                    json.dump(structured_chunks, f, ensure_ascii=False, indent=2)
-                logger.info(f"💾 Step 2 output saved to: {output_json_path}")
-            except Exception as e:
-                logger.error(f"❌ Failed to save Step 2 JSON: {e}")
+        if chunks:
+            out_path = self.step2_dir / fstem / "granular_content.json"
+            out_path.parent.mkdir(exist_ok=True, parents=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(chunks, f, ensure_ascii=False, indent=2)
                 
-        return structured_chunks
+        return chunks
 
-    # =========================================================================
-    # Step 3: Async Ingestion to LightRAG
-    # =========================================================================
-
+    # === Step 3: Ingest ===
     async def ingest_to_lightrag(self, chunks: List[Dict[str, Any]], doc_id: str):
-        """
-        Adapt Dict chunks to LightRAG's custom `ainsert_structured_chunks`.
-        """
-        if not self.rag:
-            await self.initialize_rag()
+        if not self.rag: await self.initialize_rag()
+        
+        logger.info(f"🚀 Ingesting {len(chunks)} chunks...")
+        rag_chunks = [{
+            "content": c['content'],
+            "priority": c['metadata']['priority'],
+            "page_info": f"Page {c['metadata']['page']}",
+            "file_path": c['metadata']['source']
+        } for c in chunks]
+        
+        full_text = "\n\n".join(c['content'] for c in chunks)
+        await self.rag.ainsert_structured_chunks(full_text=full_text, text_chunks=rag_chunks, doc_id=doc_id)
+        logger.success(f"✅ Ingested: {doc_id}")
 
-        logger.info(f"🚀 [Step 3] Ingesting {len(chunks)} chunks into LightRAG...")
-
-        # Transform to format accepted by ainsert_structured_chunks
-        formatted_chunks = []
-        full_text_buffer = []
-
-        for c in chunks:
-            meta = c['metadata']
-            
-            chunk_data = {
-                "content": c['content'],
-                # 這裡會吃到 run_hybrid_etl 設定的 "NORMAL"
-                "priority": meta.get('priority', 'NORMAL'),
-                "page_info": f"Page {meta.get('page', 0)}",
-                "file_path": meta.get('source', doc_id)
-            }
-            
-            formatted_chunks.append(chunk_data)
-            full_text_buffer.append(c['content'])
-
-        full_text = "\n\n".join(full_text_buffer)
-
-        # Use methods available in your lightrag.py
-        await self.rag.ainsert_structured_chunks(
-            full_text=full_text,
-            text_chunks=formatted_chunks, 
-            doc_id=doc_id
-        )
-        logger.success(f"✅ LightRAG Ingestion Complete for {doc_id}")
-
-    # =========================================================================
-    # Main Orchestrator
-    # =========================================================================
-
+    # === Main Entry ===
     async def process_document(self, file_path: str):
-        file_name = os.path.basename(file_path)
-        doc_id = file_name 
-
+        fname = os.path.basename(file_path)
         try:
-            # 1. OCR
-            json_path = await self.run_mineru_extraction(file_path)
-            
-            # 2. ETL
-            chunks = await self.run_hybrid_etl(json_path, file_name)
-            
-            # 3. Ingest
-            if chunks:
-                await self.ingest_to_lightrag(chunks, doc_id)
-            else:
-                logger.warning(f"⚠️ No chunks generated for {file_name}")
-
-            return {"status": "success", "doc_id": doc_id}
-
+            jpath = await self.run_mineru_extraction(file_path)
+            chunks = await self.run_hybrid_etl(jpath, fname)
+            if chunks: await self.ingest_to_lightrag(chunks, fname)
+            return {"status": "success", "doc_id": fname}
         except Exception as e:
-            logger.exception(f"🔥 Critical Pipeline Failure for {file_name}")
+            logger.exception(f"🔥 Failure: {fname}")
             return {"status": "error", "error": str(e)}
 
 if __name__ == "__main__":
     async def main():
-        pipeline = RagAnythingPipeline(
-            upload_dir="./data/input",
-            output_dir="./data/output",
-            sql_db_path="./financial.db",
-            sql_db_path="./data/financial.db",
-            working_dir="./data/rag_storage"
-        )
-        logger.info("Pipeline initialized. Call process_document() to run.")
-
+        # Standalone Test
+        p = RagAnythingPipeline("./data/input", "./data/output", "./data/financial.db", "./data/rag_storage")
+        logger.info("Pipeline Ready.")
     asyncio.run(main())
