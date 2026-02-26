@@ -41,7 +41,6 @@ dependencies = [
     "tiktoken",
     "xlsxwriter>=3.1.0",
     "raganything @ git+https://github.com/SammiHungsm/RAG-Anything.git",
-
     # --- Nanobot 核心依賴 (新增部分) ---
     "litellm",          # Nanobot 的 LLM Provider 核心
     "loguru",           # Nanobot 的 Logging 系統
@@ -52,6 +51,7 @@ dependencies = [
     "markdownify",      # 將網頁轉為 Markdown 俾 LLM 讀
     "duckduckgo-search",# WebSearchTool (如果有的話)
     "pyyaml",           # 處理 Config 檔案
+    "docker>=7.1.0",
 ]
 
 [project.optional-dependencies]

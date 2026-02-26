@@ -369,7 +369,7 @@ References
 [2] Source_Name [Page Y]
 
 CRITICAL RULES FOR REFERENCES:
-1. Identify the 'Source:' and 'Page' fields explicitly provided at the beginning of each text chunk (e.g., "Source: HSBC_Report_Source_A | Page 1").
+1. Identify the 'Source:' and 'Page' fields explicitly provided at the beginning of each text chunk (e.g., "Source: Source_A | Page 1").
 2. USE ONLY that specific 'Source_Name' and 'Page Number' for the citation.
 3. DO NOT use Entity Names (like "HSBC Annual Financial Overview") as the source name.
 4. Ensure the Source_Name matches the 'Source:' field exactly.`;
