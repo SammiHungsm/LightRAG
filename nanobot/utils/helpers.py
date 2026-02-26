@@ -3,7 +3,6 @@
 from pathlib import Path
 from datetime import datetime
 
-
 def ensure_dir(path: Path) -> Path:
     """Ensure a directory exists, creating it if necessary."""
     path.mkdir(parents=True, exist_ok=True)
@@ -37,21 +36,10 @@ def get_sessions_path() -> Path:
     return ensure_dir(get_data_path() / "sessions")
 
 
-def get_memory_path(workspace: Path | None = None) -> Path:
-    """Get the memory directory within the workspace."""
-    ws = workspace or get_workspace_path()
-    return ensure_dir(ws / "memory")
-
-
 def get_skills_path(workspace: Path | None = None) -> Path:
     """Get the skills directory within the workspace."""
     ws = workspace or get_workspace_path()
     return ensure_dir(ws / "skills")
-
-
-def today_date() -> str:
-    """Get today's date in YYYY-MM-DD format."""
-    return datetime.now().strftime("%Y-%m-%d")
 
 
 def timestamp() -> str:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 from loguru import logger
 
@@ -11,9 +11,6 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
-
-if TYPE_CHECKING:
-    from nanobot.session.manager import SessionManager
 
 
 class ChannelManager:
@@ -26,10 +23,9 @@ class ChannelManager:
     - Route outbound messages
     """
     
-    def __init__(self, config: Config, bus: MessageBus, session_manager: "SessionManager | None" = None):
+    def __init__(self, config: Config, bus: MessageBus):
         self.config = config
         self.bus = bus
-        self.session_manager = session_manager
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         
@@ -46,11 +42,10 @@ class ChannelManager:
                     self.config.channels.telegram,
                     self.bus,
                     groq_api_key=self.config.providers.groq.api_key,
-                    session_manager=self.session_manager,
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:
-                logger.warning(f"Telegram channel not available: {e}")
+                logger.warning("Telegram channel not available: {}", e)
         
         # WhatsApp channel
         if self.config.channels.whatsapp.enabled:
@@ -61,7 +56,7 @@ class ChannelManager:
                 )
                 logger.info("WhatsApp channel enabled")
             except ImportError as e:
-                logger.warning(f"WhatsApp channel not available: {e}")
+                logger.warning("WhatsApp channel not available: {}", e)
 
         # Discord channel
         if self.config.channels.discord.enabled:
@@ -72,7 +67,7 @@ class ChannelManager:
                 )
                 logger.info("Discord channel enabled")
             except ImportError as e:
-                logger.warning(f"Discord channel not available: {e}")
+                logger.warning("Discord channel not available: {}", e)
         
         # Feishu channel
         if self.config.channels.feishu.enabled:
@@ -83,7 +78,19 @@ class ChannelManager:
                 )
                 logger.info("Feishu channel enabled")
             except ImportError as e:
-                logger.warning(f"Feishu channel not available: {e}")
+                logger.warning("Feishu channel not available: {}", e)
+
+        # Mochat channel
+        if self.config.channels.mochat.enabled:
+            try:
+                from nanobot.channels.mochat import MochatChannel
+
+                self.channels["mochat"] = MochatChannel(
+                    self.config.channels.mochat, self.bus
+                )
+                logger.info("Mochat channel enabled")
+            except ImportError as e:
+                logger.warning("Mochat channel not available: {}", e)
 
         # DingTalk channel
         if self.config.channels.dingtalk.enabled:
@@ -94,7 +101,7 @@ class ChannelManager:
                 )
                 logger.info("DingTalk channel enabled")
             except ImportError as e:
-                logger.warning(f"DingTalk channel not available: {e}")
+                logger.warning("DingTalk channel not available: {}", e)
 
         # Email channel
         if self.config.channels.email.enabled:
@@ -105,14 +112,37 @@ class ChannelManager:
                 )
                 logger.info("Email channel enabled")
             except ImportError as e:
-                logger.warning(f"Email channel not available: {e}")
+                logger.warning("Email channel not available: {}", e)
+
+        # Slack channel
+        if self.config.channels.slack.enabled:
+            try:
+                from nanobot.channels.slack import SlackChannel
+                self.channels["slack"] = SlackChannel(
+                    self.config.channels.slack, self.bus
+                )
+                logger.info("Slack channel enabled")
+            except ImportError as e:
+                logger.warning("Slack channel not available: {}", e)
+
+        # QQ channel
+        if self.config.channels.qq.enabled:
+            try:
+                from nanobot.channels.qq import QQChannel
+                self.channels["qq"] = QQChannel(
+                    self.config.channels.qq,
+                    self.bus,
+                )
+                logger.info("QQ channel enabled")
+            except ImportError as e:
+                logger.warning("QQ channel not available: {}", e)
     
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         """Start a channel and log any exceptions."""
         try:
             await channel.start()
         except Exception as e:
-            logger.error(f"Failed to start channel {name}: {e}")
+            logger.error("Failed to start channel {}: {}", name, e)
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
@@ -126,7 +156,7 @@ class ChannelManager:
         # Start channels
         tasks = []
         for name, channel in self.channels.items():
-            logger.info(f"Starting {name} channel...")
+            logger.info("Starting {} channel...", name)
             tasks.append(asyncio.create_task(self._start_channel(name, channel)))
         
         # Wait for all to complete (they should run forever)
@@ -148,9 +178,9 @@ class ChannelManager:
         for name, channel in self.channels.items():
             try:
                 await channel.stop()
-                logger.info(f"Stopped {name} channel")
+                logger.info("Stopped {} channel", name)
             except Exception as e:
-                logger.error(f"Error stopping {name}: {e}")
+                logger.error("Error stopping {}: {}", name, e)
     
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
@@ -163,14 +193,20 @@ class ChannelManager:
                     timeout=1.0
                 )
                 
+                if msg.metadata.get("_progress"):
+                    if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
+                        continue
+                    if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
+                        continue
+                
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:
                         await channel.send(msg)
                     except Exception as e:
-                        logger.error(f"Error sending to {msg.channel}: {e}")
+                        logger.error("Error sending to {}: {}", msg.channel, e)
                 else:
-                    logger.warning(f"Unknown channel: {msg.channel}")
+                    logger.warning("Unknown channel: {}", msg.channel)
                     
             except asyncio.TimeoutError:
                 continue
