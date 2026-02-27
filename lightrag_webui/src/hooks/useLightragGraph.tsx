@@ -197,19 +197,19 @@ const createSigmaGraph = (rawGraph: RawGraph | null) => {
   const graph = new UndirectedGraph()
 
   // Add nodes from raw graph data
+  // 修改 Line 144 附近
   for (const rawNode of rawGraph?.nodes ?? []) {
-    // Ensure we have fresh random positions for nodes
     seedrandom(rawNode.id + Date.now().toString(), { global: true })
     const x = Math.random()
     const y = Math.random()
 
     graph.addNode(rawNode.id, {
-      label: rawNode.labels.join(', '),
+      // 🌟 修正：優先使用 backend 的 label，如果沒有才用 id，最後才 fallback 到 labels
+      label: (rawNode as any).label || rawNode.id || rawNode.labels.join(', '), 
       color: rawNode.color,
       x: x,
       y: y,
       size: rawNode.size,
-      // for node-border
       borderColor: Constants.nodeBorderColor,
       borderSize: 0.2
     })
@@ -722,8 +722,10 @@ const useLightrangeGraph = () => {
                     (nodePositions[nodeToExpand.id].y + Math.sin(randomAngle + angle) * spreadFactor);
 
           // Add the new node to the sigma graph with calculated position
+          // 修改 Line 427 附近
           sigmaGraph.addNode(nodeId, {
-            label: newNode.labels.join(', '),
+            // 🌟 修正：同樣優先讀取 label 屬性
+            label: (newNode as any).label || newNode.id || newNode.labels.join(', '),
             color: newNode.color,
             x: x,
             y: y,

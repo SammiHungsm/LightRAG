@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from lightrag.base import QueryParam
 from lightrag.utils import logger, EmbeddingFunc
 from lightrag.api.config import global_args 
-from lightrag.llm.openai import openai_embed
+from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.lightrag import LightRAG
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.api.routers.query_routes import QueryRequest, QueryResponse 
@@ -179,7 +179,7 @@ def _create_master_agent(collected_refs: list) -> AgentLoop:
         default_model=global_args.llm_model
     )
     
-    agent = AgentLoop(bus=MessageBus(), provider=provider, workspace=workspace_path, max_iterations=20)
+    agent = AgentLoop(bus=MessageBus(), provider=provider, workspace=workspace_path, max_iterations=100)
     
     # 🌟 修正：Loader 去 /app/nanobot 搵 skills 
     loader = SkillsLoader(workspace=nanobot_root)
@@ -282,30 +282,34 @@ def create_adapter_routes(rag, api_key=None, top_k=60):
 
             # 搵返 backend_router.py 入面迴圈處理 nodes 嘅位置
             nodes = []
+            # 喺 backend_router.py 的 get_dynamic_graphs 內修改 loop
             for n, data in G.nodes(data=True):
-                # 🌟 修正：強制定義對應關係
-                # 1. 類型 (Category)：優先搵 d1 (你 Raw Data 顯示 d1 係類型)
-                e_type = data.get("d1") or data.get("entity_type") or data.get("type") or "Unknown"
-                
-                # 2. 名稱 (Label)：直接用 Node ID (n)，因為佢就係 "HKFRS 9"
-                # 同時確保 data 入面原本嘅 'label' 唔會覆蓋咗佢
-                display_name = str(n) 
+                # 1. 確定正確的 Type 同 Name
+                real_type = data.get("d1") or data.get("entity_type") or data.get("type") or "Unknown"
+                real_name = str(n) # n 通常係 "HKFRS 9"
+
+                # 2. 🌟 高級清理邏輯：唔好用 data.copy()，改為「只拿需要的」
+                # 這樣可以確保原本 GraphML 裡面那個裝著 "regulation" 的 'label' 徹底消失
+                clean_props = {}
+                for k, v in data.items():
+                    # 排除所有會干擾前端渲染的系統 Key
+                    if k not in ["label", "name", "entity_type", "type", "d1", "d0"]:
+                        clean_props[k] = v
 
                 nodes.append({
                     "id": str(n),
-                    "label": display_name,   # 畫面上顯示實體名 (HKFRS 9)
-                    "labels": [e_type],      # 過濾器顯示類型 (regulation)
+                    "label": real_name,       # 🌟 Sigma 渲染引擎主要讀呢個
+                    "labels": [real_type],    # 過濾用
                     "properties": {
-                        **data,
-                        "entity_type": e_type,
-                        "name": display_name,
-                        "label": display_name # 🌟 再次強制覆蓋，防止 Sigma.js 內部邏輯混亂
+                        **clean_props,        # 只有純粹的描述、時間等數據
+                        "entity_type": real_type, # 上色用
+                        "name": real_name,
+                        "label": real_name    # 🌟 雙重保險：覆蓋 properties 內可能存在的 label
                     },
                     "x": np.random.uniform(-100, 100),
                     "y": np.random.uniform(-100, 100),
                     "size": 10 + (G.degree(n) * 2) 
                 })
-                        
             # 5. 轉換 Edge 格式
             edges = []
             for u, v, data in G.edges(data=True):
