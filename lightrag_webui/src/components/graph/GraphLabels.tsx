@@ -62,9 +62,9 @@ const GraphLabels = () => {
   }, [])
 
   // Force AsyncSelect to re-render when label changes externally (e.g., from entity rename/merge)
-  useEffect(() => {
-    setSelectKey(prev => prev + 1)
-  }, [label])
+  // useEffect(() => {
+  //   setSelectKey(prev => prev + 1)
+  // }, [label])
 
   // Force AsyncSelect to re-render when dropdown refresh is triggered (e.g., after entity rename)
   useEffect(() => {

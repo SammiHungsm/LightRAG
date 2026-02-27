@@ -59,7 +59,7 @@ async def extract_metadata_with_llm(md_file_path: str, fallback_name: str, doc_t
         輸出格式: {"name": "三生製藥", "stock_code": "1530", "year": "2024"}"""
 
     try:
-        logger.info(f"   🤖 正在分析封面及提取標籤 ({doc_type})...")
+        logger.info(f"   🤖 正在呼叫 LLM 分析封面及提取標籤 ({doc_type})...")
         response = await openai_complete_if_cache(
             model=LLM_MODEL, prompt=cover_text, system_prompt=system_prompt,
             api_key=API_KEY, base_url=BASE_URL
@@ -147,25 +147,43 @@ async def auto_batch_process():
             json_files = glob.glob(os.path.join(project_dir, "**/*_content_list.json"), recursive=True)
             
             if not md_files or not json_files:
+                logger.warning(f"⚠️ 專案 {folder_name} 缺乏必要的 md 或 json 文件，已跳過。")
                 continue
             
-            # 1. 抽 Metadata (用於路由資料夾)
-            metadata = await extract_metadata_with_llm(md_files[0], folder_name, doc_type)
+            # ========================================================
+            # 🌟 [修改核心] 加入 Metadata Cache 機制，防止 LLM 生成漂移
+            # ========================================================
+            metadata_cache_path = os.path.join(project_dir, "metadata_cache.json")
+            
+            if os.path.exists(metadata_cache_path):
+                # 如果已經有 cache，直接讀取
+                logger.info(f"📂 [CACHE HIT] 發現已存檔的 Metadata，跳過 LLM 解析: {folder_name}")
+                with open(metadata_cache_path, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+            else:
+                # 1. 抽 Metadata (用於路由資料夾)
+                logger.info(f"🧠 [LLM TASK] 未發現 Metadata，開始解析: {folder_name}")
+                metadata = await extract_metadata_with_llm(md_files[0], folder_name, doc_type)
+                
+                # 將抽出來的結果 Save 低，下次唔洗再抽
+                with open(metadata_cache_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, ensure_ascii=False, indent=4)
+                logger.info(f"💾 [CACHE SAVED] 已將 Metadata 存檔至: {metadata_cache_path}")
+            # ========================================================
             
             # 2. 決定 Workspace 路徑 (Index 同財報分家)
             if doc_type == "index":
-                # 指數路徑: rag_storage/index/恆生生科指數_2026-Jan
                 workspace_dir = f"./data/rag_storage/index/{metadata['name']}_{metadata['year']}"
             else:
-                # 財報路徑: rag_storage/financial_report/三生製藥_1530/2024
                 stock_tag = f"_{metadata['stock_code']}" if metadata['stock_code'] != "N/A" else ""
                 workspace_dir = f"./data/rag_storage/financial_report/{metadata['name']}{stock_tag}/{metadata['year']}"
 
-            # 3. 自動清理殘留
+            # 3. 自動清理殘留 / 跳過已完成
             if os.path.exists(workspace_dir):
                 if os.path.exists(os.path.join(workspace_dir, "graph_chunk_entity_relation.graphml")):
-                    logger.info(f"⏭️  跳過已完成專案: {metadata['name']}")
+                    logger.info(f"⏭️  [SKIP] 跳過已完成的專案 (Workspace 完整): {metadata['name']}")
                     continue
+                logger.warning(f"🧹 [CLEANUP] 發現未完成的 Workspace，正在清理並重建: {workspace_dir}")
                 shutil.rmtree(workspace_dir)
 
             # 4. 準備 Content List 並注入「控制上下文 (Context Control)」
@@ -186,7 +204,7 @@ async def auto_batch_process():
                             item[field] = os.path.abspath(os.path.join(json_dir, item[field])).replace('\\', '/')
 
             # 5. 開始建庫
-            logger.info(f"▶️  處理中: {metadata['name']} ({doc_type})")
+            logger.info(f"▶️  開始建庫: {metadata['name']} ({doc_type}) -> {workspace_dir}")
             await build_financial_knowledge_graph(content_list, f"{folder_name}.pdf", workspace_dir)
 
 def main():

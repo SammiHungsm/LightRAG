@@ -334,26 +334,30 @@ const silentRefreshGuestToken = async (): Promise<string> => {
   return refreshTokenPromise;
 };
 
-// Interceptor: add api key and check authentication
+// ========== 1. 優化後的 Interceptor ==========
 axiosInstance.interceptors.request.use((config) => {
-  // Skip interceptor for token refresh requests
   if (config.headers['X-Skip-Interceptor']) {
     delete config.headers['X-Skip-Interceptor'];
     return config;
   }
 
-  const apiKey = useSettingsStore.getState().apiKey
+  const apiKey = useSettingsStore.getState().apiKey;
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
 
-  // Always include token if it exists, regardless of path
-  if (token) {
-    config.headers['Authorization'] = `Bearer ${token}`
+  if (token) config.headers['Authorization'] = `Bearer ${token}`;
+  if (apiKey) config.headers['X-API-Key'] = apiKey;
+
+  // 🌟 自動附加 Workspace 參數 (統一使用 params 對象)
+  const currentWorkspace = localStorage.getItem('SELECTED_WORKSPACE');
+  if (currentWorkspace) {
+    config.params = {
+      ...config.params,
+      workspace: currentWorkspace
+    };
   }
-  if (apiKey) {
-    config.headers['X-API-Key'] = apiKey
-  }
-  return config
-})
+
+  return config;
+});
 
 // Interceptor：handle token renewal and authentication errors
 axiosInstance.interceptors.response.use(
@@ -450,14 +454,29 @@ axiosInstance.interceptors.response.use(
 )
 
 // API methods
+export const getWorkspaceList = async () => {
+  const response = await axiosInstance.get('/workspaces/list');
+  return response.data;
+};
+
+// 修改 lightrag.ts 中的 queryGraphs
 export const queryGraphs = async (
   label: string,
   maxDepth: number,
   maxNodes: number
 ): Promise<LightragGraphType> => {
-  const response = await axiosInstance.get(`/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}`)
-  return response.data
-}
+  // 🌟 雖然 Interceptor 有加，但手動傳入更安全
+  const currentWorkspace = localStorage.getItem('SELECTED_WORKSPACE');
+  const response = await axiosInstance.get('/graphs', {
+    params: { 
+      label, 
+      max_depth: maxDepth, 
+      max_nodes: maxNodes,
+      workspace: currentWorkspace // 顯式傳遞
+    }
+  });
+  return response.data;
+};
 
 export const getGraphLabels = async (): Promise<string[]> => {
   const response = await axiosInstance.get('/graph/label/list')
@@ -513,6 +532,7 @@ export const queryText = async (request: QueryRequest): Promise<QueryResponse> =
   return response.data
 }
 
+// ========== 2. 修正後的 Streaming API (必須手動加參數) ==========
 export const queryTextStream = async (
   request: QueryRequest,
   onChunk: (chunk: string) => void,
@@ -520,19 +540,25 @@ export const queryTextStream = async (
 ) => {
   const apiKey = useSettingsStore.getState().apiKey;
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
+  
+  // 🌟 獲取 Workspace
+  const currentWorkspace = localStorage.getItem('SELECTED_WORKSPACE');
+  
+  // 🌟 手動構建 URL，因為 fetch 唔受 Interceptor 影響
+  let url = `${backendBaseUrl}/query/stream`;
+  if (currentWorkspace) {
+    url += `?workspace=${encodeURIComponent(currentWorkspace)}`;
+  }
+
   const headers: HeadersInit = {
     'Content-Type': 'application/json',
     'Accept': 'application/x-ndjson',
   };
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-  if (apiKey) {
-    headers['X-API-Key'] = apiKey;
-  }
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  if (apiKey) headers['X-API-Key'] = apiKey;
 
   try {
-    const response = await fetch(`${backendBaseUrl}/query/stream`, {
+    const response = await fetch(url, { // 使用加上參數的 URL
       method: 'POST',
       headers: headers,
       body: JSON.stringify(request),
@@ -941,20 +967,22 @@ export const loginToServer = async (username: string, password: string): Promise
  * @param allowMerge Whether to merge into an existing entity when renaming to a duplicate name
  * @returns Promise with the updated entity information
  */
+
 export const updateEntity = async (
   entityName: string,
   updatedData: Record<string, any>,
   allowRename: boolean = false,
   allowMerge: boolean = false
 ): Promise<EntityUpdateResponse> => {
+  // 🌟 Interceptor 會自動根據 SELECTED_WORKSPACE 加掛參數
   const response = await axiosInstance.post('/graph/entity/edit', {
     entity_name: entityName,
     updated_data: updatedData,
     allow_rename: allowRename,
     allow_merge: allowMerge
-  })
-  return response.data
-}
+  });
+  return response.data;
+};
 
 /**
  * Updates a relation's properties in the knowledge graph
@@ -972,9 +1000,9 @@ export const updateRelation = async (
     source_id: sourceEntity,
     target_id: targetEntity,
     updated_data: updatedData
-  })
-  return response.data
-}
+  });
+  return response.data;
+};
 
 /**
  * Checks if an entity name already exists in the knowledge graph

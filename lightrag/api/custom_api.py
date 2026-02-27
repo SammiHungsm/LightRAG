@@ -4,10 +4,12 @@ import json
 import asyncio
 import numpy as np
 import docker
+import networkx as nx
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
-from fastapi import APIRouter, Depends
-from fastapi.responses import StreamingResponse
+from typing import List, Dict, Any, Tuple, Optional
+from collections import defaultdict
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 
 # LightRAG 核心
 from lightrag.base import QueryParam
@@ -28,11 +30,61 @@ from nanobot.agent.skills import SkillsLoader
 router = APIRouter(tags=["query"])
 
 # ==========================================
-# 工具 1：動態目錄掃描器 (Workspace Discovery)
+# 1. 基礎設施：Embedding 與 RAG 緩存
+# ==========================================
+_rag_cache: Dict[str, LightRAG] = {}
+
+def _get_dedicated_embedding():
+    """修正：返傳一個 EmbeddingFunc 物件，但要確保 LightRAG 接收到正確格式"""
+    async def embed_wrapper(texts: list[str]) -> np.ndarray:
+        return await openai_embed.func(
+            texts=texts, 
+            model=global_args.embedding_model,
+            api_key=global_args.llm_binding_api_key, 
+            base_url=global_args.llm_binding_host
+        )
+    # 🌟 呢度返傳成個 EmbeddingFunc，因為佢內部實作咗 __call__
+    return EmbeddingFunc(embedding_dim=1024, max_token_size=8192, func=embed_wrapper)
+def _get_dedicated_llm():
+    async def llm_wrapper(prompt, system_prompt=None, history_messages=[], **kwargs):
+        return await openai_complete_if_cache(
+            model=global_args.llm_model,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            history_messages=history_messages,
+            api_key=global_args.llm_binding_api_key,
+            base_url=global_args.llm_binding_host,
+            **kwargs
+        )
+    return llm_wrapper
+
+def get_rag_instance(ws_path_from_ui: str) -> LightRAG:
+    """ws_path_from_ui 應該係例如 'financial_report/3SBio/2024'"""
+    base_dir = Path("/app/data/rag_storage")
+    
+    # 🌟 避免重複拼接：如果 ws_path 已經包含 base_dir 嘅名，要處理返
+    if "data/rag_storage" in ws_path_from_ui:
+        # 如果傳入嚟已經係完整路徑，就直接用
+        full_path = str(Path(ws_path_from_ui).absolute())
+    else:
+        full_path = str((base_dir / ws_path_from_ui.lstrip("/")).absolute())
+    
+    if full_path not in _rag_cache:
+        logger.info(f"🧬 正在初始化物理路徑: {full_path}")
+        # 🌟 修正： embedding_func 要傳入 Callable 
+        _rag_cache[full_path] = LightRAG(
+            working_dir=full_path,
+            llm_model_func=_get_dedicated_llm(),
+            embedding_func=_get_dedicated_embedding() # 佢係一個 Callable 物件
+        )
+    return _rag_cache[full_path]
+
+# ==========================================
+# 2. Agent 工具集 (完全保留引用收集與導航邏輯)
 # ==========================================
 class WorkspaceDiscoveryTool(Tool):
     name = "list_available_workspaces"
-    description = "掃描系統內所有已建庫的資料。你可以看到有咩 index (名單) 同埋有咩 financial_report (具體公司年份)。"
+    description = "掃描系統內所有已建庫的資料夾，返回 index 和 financial_report 類別及其可用年份。"
     parameters = {"type": "object", "properties": {}}
 
     def __init__(self, base_path: Path):
@@ -40,102 +92,87 @@ class WorkspaceDiscoveryTool(Tool):
         self.base_path = base_path
 
     async def execute(self, **kwargs) -> str:
-        structure = {}
+        structure = {"index": [], "financial_report": {}}
         for cat in ["index", "financial_report"]:
             cat_path = self.base_path / cat
             if not cat_path.exists(): continue
             if cat == "index":
                 structure[cat] = [f.name for f in cat_path.iterdir() if f.is_dir()]
             else:
-                report_map = {}
                 for company in cat_path.iterdir():
                     if company.is_dir():
-                        years = [y.name for y in company.iterdir() if y.is_dir()]
-                        report_map[company.name] = years
-                structure[cat] = report_map
+                        structure["financial_report"][company.name] = [y.name for y in company.iterdir() if y.is_dir()]
         return json.dumps(structure, indent=2, ensure_ascii=False)
 
-# ==========================================
-# 工具 2：動態圖譜查詢 (Multi-RAG Router)
-# ==========================================
 class FinancialRAGTool(Tool):
     name = "access_financial_data"
-    description = "入去某個特定嘅知識庫攞數據。你必須提供 category (index/financial_report), workspace_name 同埋 query。"
+    description = "訪問特定知識庫獲取數據。需提供 category, workspace_name, query, year(財報必填)。"
     parameters = {
         "type": "object",
         "properties": {
             "category": {"type": "string", "enum": ["index", "financial_report"]},
-            "workspace_name": {"type": "string", "description": "資料夾名稱，例如 '3SBio_1530'"},
-            "year": {"type": "string", "description": "年份，如果是財報類則必填"},
-            "query": {"type": "string", "description": "具體要問嘅問題"}
+            "workspace_name": {"type": "string"},
+            "year": {"type": "string"},
+            "query": {"type": "string"}
         },
         "required": ["category", "workspace_name", "query"]
     }
 
-    def __init__(self, base_path: Path, embed_func):
+    def __init__(self, base_path: Path, refs_list: list):
         super().__init__()
         self.base_path = base_path
-        self.embed_func = embed_func
-        self._rag_cache = {}
+        self.refs_list = refs_list
 
     async def execute(self, category: str, workspace_name: str, query: str, year: str = None, **kwargs) -> str:
         if category == "index":
             target_dir = self.base_path / "index" / workspace_name
         else:
-            if not year: return "錯誤：查詢財報類數據必須提供 year 參數。"
+            if not year: return "Error: year is required for financial reports."
             target_dir = self.base_path / "financial_report" / workspace_name / year
 
-        if not target_dir.exists():
-            return f"錯誤：找不到工作空間 {workspace_name}。"
-
-        dir_key = str(target_dir)
-        if dir_key not in self._rag_cache:
-            logger.info(f"🧬 動態載入圖譜實例: {dir_key}")
-            self._rag_cache[dir_key] = LightRAG(working_dir=dir_key, embedding_func=self.embed_func)
+        if not target_dir.exists(): return f"Error: Workspace {workspace_name} not found."
         
-        rag = self._rag_cache[dir_key]
-        result = await rag.aquery(query, param=QueryParam(mode="mix"))
-        return f"\n--- [數據來源: {workspace_name} ({category})] ---\n{result}\n"
+        rag = get_rag_instance(str(target_dir))
+        param = QueryParam(mode="mix", stream=False, top_k=60)
+        result = await rag.aquery_llm(query, param=param)
+        
+        data = result.get("data", {})
+        if "references" in data:
+            self.refs_list.extend(data["references"])
+            
+        content = result.get("llm_response", {}).get("content", "")
+        return f"\n--- [數據來源: {workspace_name}] ---\n{content}\n"
 
-# ==========================================
-# 工具 3：Python 沙盒 (Docker)
-# ==========================================
 class PythonSandboxTool(Tool):
     name = "python_sandbox"
-    description = "執行純 Python 代碼。計算財務指標、排名或處理複雜邏輯時必用。必須 print() 結果。"
-    parameters = {
-        "type": "object",
-        "properties": {"code": {"type": "string", "description": "Python Code"}}
-    }
+    description = "執行純 Python 代碼。計算財務指標、排名、對比數據時必用。必須使用 print() 輸出結果。"
+    parameters = {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}
 
     async def execute(self, code: str, **kwargs) -> str:
         clean_code = code.replace("```python", "").replace("```", "").strip()
         try:
             client = docker.from_env()
             logs = client.containers.run(
-                image="python:3.10-slim",
-                command=["python", "-c", clean_code],
+                image="python:3.10-slim", command=["python", "-c", clean_code],
                 remove=True, network_disabled=True, mem_limit="128m"
             )
             return logs.decode("utf-8").strip()
         except Exception as e:
-            return f"Python 執行出錯: {str(e)}"
+            return f"Python Runtime Error: {str(e)}"
 
 # ==========================================
-# 核心大腦配置與邏輯
+# 3. Agent 初始化與混合式 Prompt
 # ==========================================
-def _get_dedicated_embedding():
-    async def embed_wrapper(texts: list[str]) -> np.ndarray:
-        return await openai_embed.func(
-            texts=texts, model=global_args.embedding_model,
-            api_key=global_args.llm_binding_api_key, base_url=global_args.llm_binding_host
-        )
-    return EmbeddingFunc(embedding_dim=1024, max_token_size=8192, func=embed_wrapper)
-
-def _create_master_agent() -> AgentLoop:
+def _create_master_agent(collected_refs: list) -> AgentLoop:
     storage_path = Path("./data/rag_storage")
-    workspace_path = Path(global_args.working_dir) / "nanobot_workspace"
     
+    # 🌟 因為你冇 nanobot_workspace，Skills 喺 nanobot/skills 
+    nanobot_root = Path("/app/nanobot") 
+    
+    # 用嚟擺 Session 嘅臨時位
+    workspace_path = nanobot_root / ".workspace"
+    workspace_path.mkdir(exist_ok=True)
+
     provider = LiteLLMProvider(
         api_key=global_args.llm_binding_api_key,
         api_base=global_args.llm_binding_host,
@@ -144,87 +181,226 @@ def _create_master_agent() -> AgentLoop:
     
     agent = AgentLoop(bus=MessageBus(), provider=provider, workspace=workspace_path, max_iterations=20)
     
-    loader = SkillsLoader(workspace=workspace_path)
+    # 🌟 修正：Loader 去 /app/nanobot 搵 skills 
+    loader = SkillsLoader(workspace=nanobot_root)
     skills_context = loader.load_skills_for_context(loader.get_always_skills())
 
+    # 🌟 混合式強效 Prompt：保留嚴格約束 + 增加導航指引
     agent.system_prompt = f"""
-    你係一個專業嘅「全方位財務分析 Agent」。你負責導航多個知識庫。
+    You are a Senior Financial Research Agent tailored for MULTI-WORKSPACE internal data analysis.
     
-    工作守則：
-    1. **資訊發現**：如果你唔知有咩公司，先用 `list_available_workspaces`。
-    2. **物理跳轉**：數據係分開儲存嘅，用 `access_financial_data` 喺庫之間跳轉攞數據。
-    3. **嚴謹計算**：涉及數字處理，請參考 `batch_analyzer` 技能，並使用 `python_sandbox`。
-    4. **基於事實**：所有回答必須來自工具返回嘅數據，唔可以老作。
+    STRICT CONSTRAINTS:
+    1. **INTERNAL DATA ONLY**: You must search facts using `access_financial_data`. NEVER use your pre-trained knowledge.
+    2. **ZERO HALLUCINATION**: Answers MUST be 100% based on retrieved chunks. If no data, state "內部資料庫中沒有相關資訊".
+    3. **DATA ANALYSIS & MATH**: You MUST use `python_sandbox` for calculations. NEVER do mental math.
+    
+    NAVIGATION RULES:
+    - First, use `list_available_workspaces` to see which companies or indexes are available.
+    - Use `access_financial_data` to hop between isolated workspaces.
     
     {skills_context}
     """
     
     agent.tools.register(WorkspaceDiscoveryTool(storage_path))
-    agent.tools.register(FinancialRAGTool(storage_path, _get_dedicated_embedding()))
+    agent.tools.register(FinancialRAGTool(storage_path, collected_refs))
     agent.tools.register(PythonSandboxTool())
-    
     return agent
 
 async def process_query_logic(request: QueryRequest) -> Tuple[str, list]:
-    """統一大腦執行邏輯"""
-    agent = _create_master_agent()
-    history_str = ""
-    if request.conversation_history:
-        history_str = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in request.conversation_history[-3:]])
+    collected_refs = []
+    agent = _create_master_agent(collected_refs)
+    history = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in request.conversation_history[-3:]]) if request.conversation_history else ""
+    ans = await agent.process_direct(content=f"HISTORY:\n{history}\n\nUSER REQUEST: {request.query}", channel="webui", chat_id="master_session")
     
-    full_query = f"HISTORY:\n{history_str}\n\nUSER REQUEST: {request.query}"
-    
-    # 執行 Agent 思考流程
-    ans = await agent.process_direct(content=full_query, channel="webui", chat_id="master_session")
-    return ans, []
+    # 引用去重
+    unique_refs = []
+    seen = set()
+    for ref in collected_refs:
+        rid = ref.get('reference_id')
+        if rid and rid not in seen:
+            seen.add(rid); unique_refs.append(ref)
+    return ans, unique_refs
 
 # ==========================================
-# API Endpoints (包含原本消失的 Streaming!)
+# 4. API Endpoints (全面整合所有功能)
 # ==========================================
-def create_adapter_routes(api_key=None):
+def create_adapter_routes(rag, api_key=None, top_k=60):
     combined_auth = get_combined_auth_dependency(api_key)
+
+    @router.get("/workspaces/list")
+    async def get_workspaces_for_ui():
+        storage_path = Path("./data/rag_storage")
+        structure = []
+        for cat in ["index", "financial_report"]:
+            cat_path = storage_path / cat
+            if not cat_path.exists(): continue
+            if cat == "index":
+                for d in cat_path.iterdir():
+                    if d.is_dir(): structure.append({"label": f"📌 Index: {d.name}", "value": f"index/{d.name}"})
+            else:
+                for company in cat_path.iterdir():
+                    if company.is_dir():
+                        for year in company.iterdir():
+                            if year.is_dir():
+                                structure.append({"label": f"📊 {company.name} ({year.name})", "value": f"financial_report/{company.name}/{year.name}"})
+        return structure
+
+    @router.get("/graphs")
+    async def get_dynamic_graphs(
+        request: Request, 
+        label: str = "*", 
+        max_depth: int = 3, 
+        max_nodes: int = 1000 
+    ):
+        """WebUI 專用接口：自動校正屬性映射、修復 Label 顯示並優化效能"""
+        ws_path = request.query_params.get("workspace")
+        
+        # 1. 取得 Workspace 路徑 (確保安全且不重複拼接)
+        if not ws_path:
+            return {"nodes": [], "edges": []}
+
+        # 這裡根據你 Docker 映射的物理路徑
+        base_dir = Path("./data/rag_storage").resolve()
+        # 移除 ws_path 開頭的斜槓防止 Path 拼接跳回根目錄
+        full_path = (base_dir / ws_path.lstrip("/")).resolve() / "graph_chunk_entity_relation.graphml"
+        
+        print(f"🔍 [Graph-Request] Workspace: '{ws_path}' | Path: {full_path}")
+        
+        if not full_path.exists():
+            print(f"❌ [Graph-Request] File NOT found at: {full_path}")
+            return {"nodes": [], "edges": []}
+
+        try:
+            G = nx.read_graphml(full_path)
+            
+            # 🌟 優化 1: 按 Degree 排序，保留重要節點
+            if len(G.nodes()) > max_nodes:
+                # 搵出連接數最高嘅點
+                nodes_by_importance = sorted(G.degree(), key=lambda x: x[1], reverse=True)
+                nodes_to_keep = [n for n, deg in nodes_by_importance[:max_nodes]]
+                G = G.subgraph(nodes_to_keep).copy()
+
+            # 搵返 backend_router.py 入面迴圈處理 nodes 嘅位置
+            nodes = []
+            for n, data in G.nodes(data=True):
+                # 🌟 修正：強制定義對應關係
+                # 1. 類型 (Category)：優先搵 d1 (你 Raw Data 顯示 d1 係類型)
+                e_type = data.get("d1") or data.get("entity_type") or data.get("type") or "Unknown"
+                
+                # 2. 名稱 (Label)：直接用 Node ID (n)，因為佢就係 "HKFRS 9"
+                # 同時確保 data 入面原本嘅 'label' 唔會覆蓋咗佢
+                display_name = str(n) 
+
+                nodes.append({
+                    "id": str(n),
+                    "label": display_name,   # 畫面上顯示實體名 (HKFRS 9)
+                    "labels": [e_type],      # 過濾器顯示類型 (regulation)
+                    "properties": {
+                        **data,
+                        "entity_type": e_type,
+                        "name": display_name,
+                        "label": display_name # 🌟 再次強制覆蓋，防止 Sigma.js 內部邏輯混亂
+                    },
+                    "x": np.random.uniform(-100, 100),
+                    "y": np.random.uniform(-100, 100),
+                    "size": 10 + (G.degree(n) * 2) 
+                })
+                        
+            # 5. 轉換 Edge 格式
+            edges = []
+            for u, v, data in G.edges(data=True):
+                # 提取關係描述
+                e_description = (
+                    data.get("description") or 
+                    data.get("label") or 
+                    data.get("d8") or   # LightRAG 常見關係 ID
+                    "connected"
+                )
+                
+                edges.append({
+                    "id": f"{u}-{v}",
+                    "source": str(u),
+                    "target": str(v),
+                    "type": "arrow", # 設定連線樣式
+                    "label": e_description,
+                    "properties": data
+                })
+
+            print(f"✅ [Graph-Request] Success! Sent {len(nodes)} nodes and {len(edges)} edges.")
+            return {"nodes": nodes, "edges": edges}
+
+        except Exception as e:
+            print(f"❌ [Graph-Request] Critical Error: {str(e)}")
+            import traceback
+            traceback.print_exc() # 輸出詳細錯誤到 Docker Log
+            return {"nodes": [], "edges": []}
+        
+    @router.get("/documents")
+    async def get_dynamic_documents(request: Request):
+        ws_path = request.query_params.get("workspace")
+        if not ws_path: return {"statuses": {}}
+        target_dir = str(Path("./data/rag_storage") / ws_path)
+        rag_instance = get_rag_instance(target_dir)
+        docs = await rag_instance.doc_status.get_all()
+        status_groups = defaultdict(list)
+        for doc in docs:
+            status_groups[doc.get("status", "processed")].append(doc)
+        return {"statuses": status_groups}
+
+    @router.get("/graph/label/popular")
+    async def get_dynamic_labels(request: Request, limit: int = 300):
+        ws_path = request.query_params.get("workspace")
+        if not ws_path: return []
+        
+        rag_instance = get_rag_instance(ws_path)
+        entities = await rag_instance.full_entities.get_all()
+        
+        # 🌟 修正：喺 KV 儲存入面都要搵 d1 同 type
+        return list(set([
+            (e.get("entity_type") or e.get("type") or e.get("d1")) 
+            for e in entities 
+            if (e.get("entity_type") or e.get("type") or e.get("d1"))
+        ]))[:limit]
+
+    @router.post("/graph/entity/edit")
+    async def edit_entity(request: Request, data: dict):
+        ws_path = request.query_params.get("workspace")
+        if not ws_path: return {"status": "error", "message": "Missing workspace"}
+        rag_instance = get_rag_instance(str(Path("./data/rag_storage") / ws_path))
+        try:
+            result = await rag_instance.update_entity(data["entity_name"], data["updated_data"])
+            return {"status": "success", "data": result}
+        except Exception as e: return {"status": "error", "message": str(e)}
+
+    @router.post("/graph/relation/edit")
+    async def edit_relation(request: Request, data: dict):
+        ws_path = request.query_params.get("workspace")
+        if not ws_path: return {"status": "error", "message": "Missing workspace"}
+        rag_instance = get_rag_instance(str(Path("./data/rag_storage") / ws_path))
+        try:
+            result = await rag_instance.update_relation(data["source_id"], data["target_id"], data["updated_data"])
+            return {"status": "success", "data": result}
+        except Exception as e: return {"status": "error", "message": str(e)}
 
     @router.post("/query", response_model=QueryResponse, dependencies=[Depends(combined_auth)])
     async def master_query_endpoint(request: QueryRequest):
-        logger.info(f"🛡️ [Standard] 收到查詢請求: {request.query}")
         ans, refs = await process_query_logic(request)
-        return QueryResponse(response=ans, references=None)
+        return QueryResponse(response=ans, references=refs if refs else None)
 
     @router.post("/query/stream", dependencies=[Depends(combined_auth)])
     async def master_query_stream_endpoint(request: QueryRequest):
-        logger.info(f"🌊 [Stream] 啟動串流查詢: {request.query}")
-        
         async def event_generator():
-            # 1. 發送初始等待消息
-            yield json.dumps({"response": "⏳ **AI 正在導航多個知識庫並分析數據**...\n請稍候...\n\n---\n\n"}) + "\n"
-            
-            # 2. 啟動 Agent 背景任務
+            yield json.dumps({"response": "⏳ **AI 正在多庫導航並執筆分析**...\n\n---\n\n"}) + "\n"
             task = asyncio.create_task(process_query_logic(request))
-            
-            # 3. 心跳機制：當 Agent 仲諗緊嘢嗰陣，每 2 秒噴一個點點
             while not task.done():
                 await asyncio.sleep(2.0)
-                if not task.done():
-                    yield json.dumps({"response": "."}) + "\n"
-            
-            # 4. 任務完成，發送最終答案
+                if not task.done(): yield json.dumps({"response": "."}) + "\n"
             try:
                 ans, refs = task.result()
-                yield json.dumps({"response": "\n\n---\n\n" + ans}) + "\n"
-                if refs:
-                    yield json.dumps({"references": refs}) + "\n"
-            except Exception as e:
-                logger.error(f"Stream generation error: {e}", exc_info=True)
-                yield json.dumps({"error": f"處理失敗: {str(e)}"}) + "\n"
-        
-        return StreamingResponse(
-            event_generator(),
-            media_type="application/x-ndjson",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
-            }
-        )
+                payload = {"response": "\n\n" + ans}
+                if refs: payload["references"] = refs
+                yield json.dumps(payload) + "\n"
+            except Exception as e: yield json.dumps({"error": str(e)}) + "\n"
+        return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
     return router

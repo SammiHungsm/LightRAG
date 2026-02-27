@@ -20,6 +20,7 @@ services:
       - ./data/mineru_models:/app/data/mineru_models
       - ./data/financial_data.db:/app/data/financial_data.db
       - ./data/output:/app/data/output
+      - ./nanobot:/app/nanobot
     env_file:
       - .env
     restart: unless-stopped
