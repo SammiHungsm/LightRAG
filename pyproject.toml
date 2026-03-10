@@ -52,6 +52,7 @@ dependencies = [
     "duckduckgo-search",# WebSearchTool (如果有的話)
     "pyyaml",           # 處理 Config 檔案
     "docker>=7.1.0",
+    "dashscope>=1.25.13",
 ]
 
 [project.optional-dependencies]
@@ -194,3 +195,10 @@ python_functions = ["test_*"]
 
 [tool.ruff]
 target-version = "py310"
+
+lite-mode = [
+    # 只保留最基本的 API 和你真正在用的 LLM / DB
+    "lightrag-hku[api]",
+    "openai>=2.0.0,<3.0.0",   # 如果你只用 OpenAI 或相容 OpenAI 的 API (如 Ollama/vLLM)
+    # "qdrant-client>=1.11.0,<2.0.0", # 如果你需要 Qdrant 才打開
+]

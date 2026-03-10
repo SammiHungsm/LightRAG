@@ -1047,3 +1047,13 @@ export const getDocumentStatusCounts = async (): Promise<StatusCountsResponse> =
   const response = await axiosInstance.get('/documents/status_counts')
   return response.data
 }
+
+// 🌟 加入黃金庫 (Verified QA) 的 API 請求
+export const verifyAndSaveQA = async (data: {
+  query: string;
+  verified_answer: string;
+  company_year: string;
+}): Promise<any> => {
+  const response = await axiosInstance.post('/feedback/like', data);
+  return response.data;
+};

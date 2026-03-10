@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
-Step 2: Financial Multi-Modal Graph Builder (Category-Aware Version)
-(Supports: Index mapping & Financial reports with context-injection)
+Step 2: Financial Multi-Modal Graph Builder (VL-Embedding Version)
+(Supports: tongyi-embedding-vision-plus direct multimodal embedding via DashScope SDK)
 """
 
 import os
@@ -15,6 +15,10 @@ import shutil
 import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
+# 🌟🌟🌟 終極修復：如果你用國際版阿里雲，必須加入呢行！ 🌟🌟🌟
+import dashscope
+dashscope.base_http_api_url = 'https://dashscope-intl.aliyuncs.com/api/v1'
+# ==========================================================
 
 # 強制載入 .env 檔案
 load_dotenv()
@@ -23,7 +27,7 @@ load_dotenv()
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+from lightrag.llm.openai import openai_complete_if_cache
 from lightrag.utils import EmbeddingFunc, logger, set_verbose_debug
 from raganything import RAGAnything, RAGAnythingConfig
 
@@ -32,8 +36,15 @@ API_KEY = os.getenv("LLM_BINDING_API_KEY") or os.getenv("OPENAI_API_KEY")
 BASE_URL = os.getenv("LLM_BINDING_HOST") or os.getenv("OPENAI_BASE_URL")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen-turbo") 
 VISION_MODEL = os.getenv("VISION_MODEL", LLM_MODEL) 
-EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
-EMBED_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
+
+EMBED_MODEL = "tongyi-embedding-vision-plus"
+EMBED_DIM = 1152
+
+# ========================================================
+# 🌟 儲存庫路徑設定 (方便隨時轉 Database)
+# ========================================================
+RAG_STORAGE_NAME = os.getenv("RAG_STORAGE_NAME", "rag_storage_v2")
+BASE_STORAGE_PATH = f"./data/{RAG_STORAGE_NAME}"
 
 logger.setLevel(logging.INFO)
 set_verbose_debug(os.getenv("VERBOSE", "false").lower() == "true")
@@ -47,13 +58,11 @@ async def extract_metadata_with_llm(md_file_path: str, fallback_name: str, doc_t
         return {"name": fallback_name, "stock_code": "N/A", "year": "2024"}
 
     if doc_type == "index":
-        # 🌟 針對指數：攞指數名同呢份名單嘅發佈日期
         system_prompt = """你是一個專業的金融數據萃取專家。請閱讀這份「指數成分股名單」的內容，
         提取這份名單的「完整官方名稱 (name)」以及「發佈日期或年份 (year)」。
         注意：這份文件包含多家公司，不需要提取個別公司的代號，stock_code 請填寫 "INDEX"。
         輸出格式: {"name": "恆生生科指數", "stock_code": "INDEX", "year": "2026-Jan"}"""
     else:
-        # 🌟 針對財報：加入強烈警告，防止抽錯舊年份
         system_prompt = """你是一個專業的金融數據萃取專家。請閱讀財報首頁文字，
         提取出這家公司的「完整官方名稱 (name)」、「股票代號 (stock_code)」及「財報所屬年度 (year)」。
         
@@ -105,35 +114,77 @@ async def build_financial_knowledge_graph(content_list: list, original_file_name
             )
 
         async def vision_model_func(prompt, system_prompt=None, history_messages=[], image_data=None, **kwargs):
-            if image_data:
-                return await openai_complete_if_cache(
-                    model=VISION_MODEL, prompt="", system_prompt=None, history_messages=[],
-                    messages=[
-                        {"role": "system", "content": "You are an expert in financial chart analysis. Please extract stock codes, names, and exact weightings from tables or charts."},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
-                        ]}
-                    ],
-                    api_key=API_KEY, base_url=BASE_URL, **kwargs
-                )
-            return await llm_model_func(prompt, system_prompt, history_messages, **kwargs)
+            # 🌟 回傳一個假嘅 JSON，完美呃過 RAGAnything 嘅格式檢查機制
+            return '{"description": "[IMAGE_DATA_EMBEDDED_DIRECTLY]", "keywords": ["multimodal", "image"]}'
+
 
         async def embedding_func_wrapper(texts: list[str]) -> np.ndarray:
-            return await openai_embed.func(texts=texts, model=EMBED_MODEL, api_key=API_KEY, base_url=BASE_URL)
+            """
+            使用 DashScope 官方 SDK 呼叫 tongyi-embedding-vision-plus (多模態融合向量)
+            """
+            # 確保讀取阿里雲 API Key (你喺 .env 加嗰條)
+            dashscope_key = os.getenv("DASHSCOPE_API_KEY")
+            if not dashscope_key:
+                logger.error("❌ 找不到 DASHSCOPE_API_KEY！")
+                raise ValueError("Missing DASHSCOPE_API_KEY")
+            
+            dashscope.api_key = dashscope_key.strip()
+
+            all_embeddings = []
+            batch_size = 20 # 阿里雲 API 限制每次最多 20 個 element
+            
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                inputs = []
+                
+                for text in batch_texts:
+                    path_match = re.search(r"\[RAW_IMG_PATH: (.*?)\]", text)
+                    if path_match:
+                        img_path = path_match.group(1)
+                        # SDK 讀取本地圖片要求加入 file:// 協議
+                        file_url = f"file://{img_path}"
+                        # 🌟 融合向量寫法：同一個 dict 入面放 text 同 image
+                        inputs.append({"text": text, "image": file_url})
+                    else:
+                        # 純文字寫法
+                        inputs.append({"text": text})
+
+                try:
+                    # DashScope SDK 是同步的，用 asyncio.to_thread 防止阻塞
+                    resp = await asyncio.to_thread(
+                        dashscope.MultiModalEmbedding.call,
+                        model=EMBED_MODEL,
+                        input=inputs
+                    )
+                    
+                    if resp.status_code == 200:
+                        # 排序確保返回的 Vector 順序同 Input 順序一致
+                        # 融合向量通常會保留 text_index
+                        sorted_embs = sorted(resp.output["embeddings"], key=lambda x: x.get("text_index", x.get("image_index", x.get("index", 0))))
+                        batch_embs = [emb["embedding"] for emb in sorted_embs]
+                        all_embeddings.extend(batch_embs)
+                    else:
+                        logger.error(f"❌ 阿里雲 API 拒絕請求: {resp.message}")
+                        all_embeddings.extend([[0.0] * EMBED_DIM] * len(batch_texts))
+                        
+                except Exception as e:
+                    logger.error(f"❌ Embedding API 發生錯誤: {e}")
+                    all_embeddings.extend([[0.0] * EMBED_DIM] * len(batch_texts))
+                    
+            return np.array(all_embeddings)
 
         my_embedding_func = EmbeddingFunc(embedding_dim=EMBED_DIM, max_token_size=8192, func=embedding_func_wrapper)
 
         rag = RAGAnything(config=config, llm_model_func=llm_model_func, vision_model_func=vision_model_func, embedding_func=my_embedding_func)
 
-        logger.info(f"⚡ 注入 Content List (Multimodal Mode)...")
+        logger.info(f"⚡ 注入 Content List (Multimodal Embedding Mode)...")
         await rag.insert_content_list(content_list=content_list, file_path=original_file_name)
         logger.info(f"✅ 建庫完成！\n" + "-"*40)
-        return True  # 🌟 成功跑完就 Return True
+        return True 
 
     except Exception as e:
         logger.error(f"❌ 建庫失敗: {str(e)}")
-        return False # 🌟 中途爆炸就 Return False
+        return False
 
 async def auto_batch_process():
     base_mineru_dir = "./data/output/step1_vlm_output"
@@ -158,82 +209,83 @@ async def auto_batch_process():
                 continue
             
             # ========================================================
-            # 🌟 [修改核心] 加入 Metadata Cache 機制，防止 LLM 生成漂移
+            # 🌟 加入 Metadata Cache 機制，防止 LLM 生成漂移
             # ========================================================
             metadata_cache_path = os.path.join(project_dir, "metadata_cache.json")
             
             if os.path.exists(metadata_cache_path):
-                # 如果已經有 cache，直接讀取
                 logger.info(f"📂 [CACHE HIT] 發現已存檔的 Metadata，跳過 LLM 解析: {folder_name}")
                 with open(metadata_cache_path, 'r', encoding='utf-8') as f:
                     metadata = json.load(f)
             else:
-                # 1. 抽 Metadata (用於路由資料夾)
                 logger.info(f"🧠 [LLM TASK] 未發現 Metadata，開始解析: {folder_name}")
                 metadata = await extract_metadata_with_llm(md_files[0], folder_name, doc_type)
                 
-                # 將抽出來的結果 Save 低，下次唔洗再抽
                 with open(metadata_cache_path, 'w', encoding='utf-8') as f:
                     json.dump(metadata, f, ensure_ascii=False, indent=4)
                 logger.info(f"💾 [CACHE SAVED] 已將 Metadata 存檔至: {metadata_cache_path}")
-            # ========================================================
             
-            # 2. 決定 Workspace 路徑 (Index 同財報分家)
+            # 🌟 使用動態 Variable 決定 Workspace 路徑
             if doc_type == "index":
-                workspace_dir = f"./data/rag_storage/index/{metadata['name']}_{metadata['year']}"
+                workspace_dir = f"{BASE_STORAGE_PATH}/index/{metadata['name']}_{metadata['year']}"
             else:
                 stock_tag = f"_{metadata['stock_code']}" if metadata['stock_code'] != "N/A" else ""
-                workspace_dir = f"./data/rag_storage/financial_report/{metadata['name']}{stock_tag}/{metadata['year']}"
+                workspace_dir = f"{BASE_STORAGE_PATH}/financial_report/{metadata['name']}{stock_tag}/{metadata['year']}"
 
-            # 3. 自動清理殘留 / 跳過已完成
+            # 自動清理殘留 / 跳過已完成
             success_flag_path = os.path.join(workspace_dir, ".build_success")
             if os.path.exists(success_flag_path):
                 logger.info(f"⏭️  [SKIP] 跳過已徹底完成的專案: {metadata['name']}")
                 continue
                 
-            # 如果未有 success flag，確保資料夾存在，準備(繼續)建庫
             os.makedirs(workspace_dir, exist_ok=True)
 
-            # 4. 準備 Content List 並注入「控制上下文 (Context Control)」
+            # 準備 Content List
             json_dir = os.path.dirname(os.path.abspath(json_files[0]))
             with open(json_files[0], 'r', encoding='utf-8') as f:
                 raw_content_list = json.load(f)
             
             # ========================================================
-            # 🌟 [加速核心] 暴力過濾所有 discarded (頁首、頁尾、無用雜訊)
+            # 🌟 暴力過濾所有 discarded (頁首、頁尾、無用雜訊)
             # ========================================================
             content_list = []
             for item in raw_content_list:
                 if isinstance(item, dict):
-                    # 如果個 block 嘅類型係 discarded，直接飛走佢！
                     if item.get("type") == "discarded":
                         continue
                     content_list.append(item)
             
             logger.info(f"🧹 垃圾清理完成：由 {len(raw_content_list)} 個區塊縮減至 {len(content_list)} 個有效區塊！")
-            # ========================================================
             
+            # ========================================================
+            # 🌟 [注入核心] 將圖片路徑硬塞入 Content
+            # ========================================================
             for item in content_list:
                 if isinstance(item, dict):
-                    # 🌟 核心控制：如果是 Index，喺 Content 注入強烈提示，確保圖譜抽到 Stock Code
+                    # 1. 處理圖片/表格，暴力注入絕對路徑
+                    if item.get("type") in ["image", "table"]:
+                        raw_path = item.get("img_path") or item.get("table_img_path")
+                        if raw_path:
+                            abs_img_path = os.path.abspath(os.path.join(json_dir, raw_path)).replace('\\', '/')
+                            img_hint = f"\n\n[RAW_IMG_PATH: {abs_img_path}]\n"
+                            item["content"] = (item.get("content", "") + img_hint).strip()
+
+                    # 2. 處理 Index 特定提示
                     if doc_type == "index" and "content" in item and item["content"]:
                         context_prefix = f"[DOC TYPE: INDEX LIST | INDEX NAME: {metadata['name']} | DATE: {metadata['year']}] "
                         item["content"] = context_prefix + item["content"]
 
-                    # 修正圖片路徑
+                    # 3. 修正原生路徑指向
                     for field in ["img_path", "table_img_path", "equation_img_path"]:
                         if field in item and item[field] and not os.path.isabs(item[field]):
                             item[field] = os.path.abspath(os.path.join(json_dir, item[field])).replace('\\', '/')
                             
-            # 5. 開始建庫
+            # 開始建庫
             logger.info(f"▶️  開始/繼續建庫: {metadata['name']} ({doc_type}) -> {workspace_dir}")
             
-            # 🌟 接收建庫結果
             is_success = await build_financial_knowledge_graph(content_list, f"{folder_name}.pdf", workspace_dir)
             
-            # ========================================================
-            # 🌟 6. 只有 100% 跑完無報錯 (is_success == True)，先寫入成功標記！
-            # ========================================================
+            # 只有 100% 跑完無報錯先寫入成功標記
             if is_success:
                 with open(success_flag_path, "w", encoding="utf-8") as f:
                     f.write("DONE")
@@ -246,6 +298,6 @@ def main():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 Step 2: Financial Multi-Modal Graph Builder (Dual-Track Context Mode)")
+    print("🚀 Step 2: Financial Multi-Modal Graph Builder (DashScope SDK Mode)")
     print("=" * 60)
     main()

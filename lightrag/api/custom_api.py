@@ -5,6 +5,8 @@ import asyncio
 import numpy as np
 import docker
 import networkx as nx
+import time
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
@@ -12,7 +14,6 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 
 from numpy.linalg import norm
-from typing import Optional
 
 # LightRAG 核心
 from lightrag.base import QueryParam
@@ -33,12 +34,17 @@ from nanobot.agent.skills import SkillsLoader
 router = APIRouter(tags=["query"])
 
 # ==========================================
+# 🌟 全局儲存庫路徑設定
+# ==========================================
+RAG_STORAGE_NAME = os.getenv("RAG_STORAGE_NAME", "rag_storage")
+BASE_STORAGE_PATH = Path(f"/app/data/{RAG_STORAGE_NAME}")
+
+# ==========================================
 # 1. 基礎設施：Embedding 與 RAG 緩存
 # ==========================================
 _rag_cache: Dict[str, LightRAG] = {}
 
 def _get_dedicated_embedding():
-    """修正：返傳一個 EmbeddingFunc 物件，但要確保 LightRAG 接收到正確格式"""
     async def embed_wrapper(texts: list[str]) -> np.ndarray:
         return await openai_embed.func(
             texts=texts, 
@@ -46,8 +52,9 @@ def _get_dedicated_embedding():
             api_key=global_args.llm_binding_api_key, 
             base_url=global_args.llm_binding_host
         )
-    # 🌟 呢度返傳成個 EmbeddingFunc，因為佢內部實作咗 __call__
-    return EmbeddingFunc(embedding_dim=1024, max_token_size=8192, func=embed_wrapper)
+    embed_dim = int(os.getenv("EMBEDDING_DIM", "1024"))
+    return EmbeddingFunc(embedding_dim=embed_dim, max_token_size=8192, func=embed_wrapper)
+
 def _get_dedicated_llm():
     async def llm_wrapper(prompt, system_prompt=None, history_messages=[], **kwargs):
         return await openai_complete_if_cache(
@@ -61,14 +68,11 @@ def _get_dedicated_llm():
         )
     return llm_wrapper
 
-# 將原本嘅 get_rag_instance 替換成呢個 Async 版本：
 async def get_rag_instance(ws_path_from_ui: str) -> LightRAG:
-    base_dir = Path("/app/data/rag_storage")
-    
-    if "data/rag_storage" in ws_path_from_ui:
+    if RAG_STORAGE_NAME in ws_path_from_ui or "data/" in ws_path_from_ui:
         full_path = str(Path(ws_path_from_ui).absolute())
     else:
-        full_path = str((base_dir / ws_path_from_ui.lstrip("/")).absolute())
+        full_path = str((BASE_STORAGE_PATH / ws_path_from_ui.lstrip("/")).absolute())
     
     if full_path not in _rag_cache:
         logger.info(f"🧬 正在初始化物理路徑: {full_path}")
@@ -77,14 +81,13 @@ async def get_rag_instance(ws_path_from_ui: str) -> LightRAG:
             llm_model_func=_get_dedicated_llm(),
             embedding_func=_get_dedicated_embedding()
         )
-        # 🌟 致命 Bug 殺手：必須初始化 Storage，否則會報 NoneType Error！
         await rag.initialize_storages()
         _rag_cache[full_path] = rag
         
     return _rag_cache[full_path]
 
 # ==========================================
-# 2. Agent 工具集 (完全保留引用收集與導航邏輯)
+# 2. Agent 工具集 
 # ==========================================
 class WorkspaceDiscoveryTool(Tool):
     name = "list_available_workspaces"
@@ -136,20 +139,28 @@ class FinancialRAGTool(Tool):
 
         if not target_dir.exists(): return f"Error: Workspace {workspace_name} not found."
         
-        rag = await get_rag_instance(str(target_dir))
-        param = QueryParam(mode="mix", stream=False, top_k=60)
-        result = await rag.aquery_llm(query, param=param)
-        
-        data = result.get("data", {})
-        if "references" in data:
-            self.refs_list.extend(data["references"])
+        try:
+            rag = await get_rag_instance(str(target_dir))
+            param = QueryParam(mode="mix", stream=False, top_k=60)
             
-        content = result.get("llm_response", {}).get("content", "")
-        return f"\n--- [數據來源: {workspace_name}] ---\n{content}\n"
+            if hasattr(rag, "aquery_llm"):
+                result = await rag.aquery_llm(query, param=param)
+            else:
+                result = await rag.aquery(query, param=param)
+                
+            if isinstance(result, dict):
+                if "data" in result and "references" in result["data"]:
+                    self.refs_list.extend(result["data"]["references"])
+                content = result.get("llm_response", {}).get("content") or result.get("response") or str(result)
+            else:
+                content = str(result)
+
+            return f"\n--- [數據來源: {workspace_name}] ---\n{content}\n"
+        except Exception as e:
+            return f"Error querying LightRAG: {str(e)}"
 
 class PythonSandboxTool(Tool):
     name = "python_sandbox"
-    # 🌟 加入強烈字眼，逼 LLM 喺 Ranking 嗰陣必須用 Python
     description = "執行純 Python 代碼。當需要對多間公司的數據進行「排序 (Sorting)」、「排名 (Ranking)」、或「數學計算」時【絕對強制使用】。嚴禁使用 LLM 自身能力進行數字排序或比大小。必須使用 print() 輸出結果。"
     parameters = {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}
 
@@ -195,30 +206,31 @@ class BatchFinancialRAGTool(Tool):
             
             try:
                 rag = await get_rag_instance(str(target_dir).replace("/app/data/rag_storage/", ""))
-                param = QueryParam(mode="mix", stream=False, top_k=30) # 批次查詢可稍微調低 top_k 節省時間
-                result = await rag.aquery_llm(query, param=param)
+                param = QueryParam(mode="mix", stream=False, top_k=30) 
                 
-                if "references" in result.get("data", {}):
-                    self.refs_list.extend(result["data"]["references"])
+                if hasattr(rag, "aquery_llm"):
+                    result = await rag.aquery_llm(query, param=param)
+                else:
+                    result = await rag.aquery(query, param=param)
                     
-                content = result.get("llm_response", {}).get("content", "")
+                if isinstance(result, dict):
+                    if "data" in result and "references" in result["data"]:
+                        self.refs_list.extend(result["data"]["references"])
+                    content = result.get("llm_response", {}).get("content") or result.get("response") or str(result)
+                else:
+                    content = str(result)
+                    
                 return f"--- [{company} 2024 數據] ---\n{content}\n"
             except Exception as e:
                 return f"[{company}]: 查詢失敗 ({str(e)})"
 
-        # 🌟 核心：使用 asyncio.gather 實現真正嘅並行檢索！
         results = await asyncio.gather(*(fetch_single(comp) for comp in workspace_names))
-        
         return "\n".join(results)
-# ==========================================
-# 3. Agent 初始化與混合式 Prompt
-# ==========================================
+
 # ==========================================
 # 3. Agent 初始化與混合式 Prompt
 # ==========================================
 def _create_master_agent(collected_refs: list) -> AgentLoop:
-    storage_path = Path("./data/rag_storage")
-    
     nanobot_root = Path("/app/nanobot") 
     workspace_path = nanobot_root / ".workspace"
     workspace_path.mkdir(exist_ok=True)
@@ -233,7 +245,6 @@ def _create_master_agent(collected_refs: list) -> AgentLoop:
     loader = SkillsLoader(workspace=nanobot_root)
     skills_context = loader.load_skills_for_context(loader.get_always_skills())
 
-    # 🌟 將你的三大 Concept 注入大腦
     agent.system_prompt = f"""
     You are a Senior Financial Research Agent.
 
@@ -257,49 +268,66 @@ def _create_master_agent(collected_refs: list) -> AgentLoop:
     {skills_context}
     """
     
-    agent.tools.register(WorkspaceDiscoveryTool(storage_path))
-    agent.tools.register(FinancialRAGTool(storage_path, collected_refs))
-    agent.tools.register(BatchFinancialRAGTool(storage_path, collected_refs))
+    agent.tools.register(WorkspaceDiscoveryTool(BASE_STORAGE_PATH))
+    agent.tools.register(FinancialRAGTool(BASE_STORAGE_PATH, collected_refs))
+    agent.tools.register(BatchFinancialRAGTool(BASE_STORAGE_PATH, collected_refs))
     agent.tools.register(PythonSandboxTool())
+    
     return agent
 
-import time
-
 # ==========================================
-# 處理核心 Query 邏輯
+# 🌟 Golden DB (黃金庫) 查詢與攔截邏輯
 # ==========================================
-async def process_query_logic(request: QueryRequest) -> Tuple[str, list]:
-    # 🌟 [進階功能預留位] 第一關：Golden QA 攔截器
-    # 如果你之後實作咗 Golden DB，可以喺度 Call:
-    # verified_answer = await search_golden_db(request.query)
-    # if verified_answer:
-    #     return f"✨ **[已核實答案 Verified]**\n\n{verified_answer}", []
+async def search_golden_db(new_query: str, ws_path: str) -> Optional[str]:
+    try:
+        golden_db_path = BASE_STORAGE_PATH / ws_path / "golden_db.jsonl"
+        if not golden_db_path.exists(): return None
+            
+        db_records = []
+        with open(golden_db_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip(): db_records.append(json.loads(line))
+        if not db_records: return None
 
-    # 🐢 第二關：常規 Agent 查詢 (Slow Path)
+        embed_func = _get_dedicated_embedding()
+        vectors = await embed_func(texts=[new_query])
+        new_vec_np = np.array(vectors[0])
+        
+        best_match, highest_score = None, 0.0
+        for record in db_records:
+            db_vec_np = np.array(record["vector"])
+            norm_new, norm_db = norm(new_vec_np), norm(db_vec_np)
+            if norm_new == 0 or norm_db == 0: continue
+            score = np.dot(new_vec_np, db_vec_np) / (norm_new * norm_db)
+            if score > highest_score:
+                highest_score = score
+                best_match = record
+                
+        if highest_score > 0.92 and best_match:
+            logger.info(f"✨ 命中 Verified 黃金庫！相似度: {highest_score:.4f}")
+            return best_match["answer"]
+        return None
+    except Exception:
+        return None
+
+async def process_query_logic(request: QueryRequest, ws_path: str) -> Tuple[str, list]:
+    # 第一關：攔截器 (Golden DB)。如果有被 Like 過嘅答案，直接秒回！
+    verified_answer = await search_golden_db(request.query, ws_path)
+    if verified_answer:
+        return f"✨ **[已核實答案 Verified Result]**\n\n{verified_answer}", []
+
+    # 第二關：常規 Agent 查詢
     collected_refs = []
     agent = _create_master_agent(collected_refs)
     
-    # 1. 嚴格限制歷史記錄 (Context Window Management)
-    # 建議只保留最後 1-2 條對話，避免過長嘅歷史令 Agent「精神恍惚」忘記 System Prompt
-    history = ""
-    if request.conversation_history:
-        recent_msgs = request.conversation_history[-1:] # 只拎最後一次對話做 Context
-        history = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in recent_msgs])
-        
-    # 2. 🌟 終極洗腦大法：動態生成 chat_id！
-    # 每次對話都是一個獨一無二的全新 Session，保證大腦完全 Clean，一定會乖乖 Call Tool
-    unique_chat_id = f"session_{int(time.time())}"
-    
-    prompt_payload = f"CONTEXT:\n{history}\n\nUSER REQUEST: {request.query}" if history else f"USER REQUEST: {request.query}"
+    # 🌟 核心修改：徹底拔除 Conversation History，實現「無狀態 (Stateless)」查詢！
+    # 無論前端傳幾多歷史過嚟，AI 都只會睇到當下呢一句，唔會受過去對話干擾。
+    prompt_payload = f"USER REQUEST: {request.query}"
 
-    # 3. 呼叫 Agent
-    ans = await agent.process_direct(
-        content=prompt_payload, 
-        channel="webui", 
-        chat_id=unique_chat_id  # 👈 核心修正：丟棄 "master_session"
-    )
+    unique_chat_id = f"session_{int(time.time())}"
+
+    ans = await agent.process_direct(content=prompt_payload, channel="webui", chat_id=unique_chat_id)
     
-    # 4. 引用去重 (Deduplication)
     unique_refs = []
     seen = set()
     for ref in collected_refs:
@@ -311,17 +339,16 @@ async def process_query_logic(request: QueryRequest) -> Tuple[str, list]:
     return ans, unique_refs
 
 # ==========================================
-# 4. API Endpoints (全面整合所有功能)
+# 4. API Endpoints
 # ==========================================
 def create_adapter_routes(rag, api_key=None, top_k=60):
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.get("/workspaces/list")
     async def get_workspaces_for_ui():
-        storage_path = Path("./data/rag_storage")
         structure = []
         for cat in ["index", "financial_report"]:
-            cat_path = storage_path / cat
+            cat_path = BASE_STORAGE_PATH / cat
             if not cat_path.exists(): continue
             if cat == "index":
                 for d in cat_path.iterdir():
@@ -335,132 +362,67 @@ def create_adapter_routes(rag, api_key=None, top_k=60):
         return structure
 
     @router.get("/graphs")
-    async def get_dynamic_graphs(
-        request: Request, 
-        label: str = "*", 
-        max_depth: int = 3, 
-        max_nodes: int = 1000 
-    ):
-        """WebUI 專用接口：自動校正屬性映射、修復 Label 顯示並優化效能"""
+    async def get_dynamic_graphs(request: Request, label: str = "*", max_depth: int = 3, max_nodes: int = 1000):
         ws_path = request.query_params.get("workspace")
-        
-        # 1. 取得 Workspace 路徑 (確保安全且不重複拼接)
-        if not ws_path:
-            return {"nodes": [], "edges": []}
-
-        # 這裡根據你 Docker 映射的物理路徑
-        base_dir = Path("./data/rag_storage").resolve()
-        # 移除 ws_path 開頭的斜槓防止 Path 拼接跳回根目錄
-        full_path = (base_dir / ws_path.lstrip("/")).resolve() / "graph_chunk_entity_relation.graphml"
-        
-        print(f"🔍 [Graph-Request] Workspace: '{ws_path}' | Path: {full_path}")
-        
-        if not full_path.exists():
-            print(f"❌ [Graph-Request] File NOT found at: {full_path}")
-            return {"nodes": [], "edges": []}
-
+        if not ws_path: return {"nodes": [], "edges": []}
+        full_path = (BASE_STORAGE_PATH / ws_path.lstrip("/")).resolve() / "graph_chunk_entity_relation.graphml"
+        if not full_path.exists(): return {"nodes": [], "edges": []}
         try:
             G = nx.read_graphml(full_path)
-            
-            # 🌟 優化 1: 按 Degree 排序，保留重要節點
             if len(G.nodes()) > max_nodes:
-                # 搵出連接數最高嘅點
                 nodes_by_importance = sorted(G.degree(), key=lambda x: x[1], reverse=True)
                 nodes_to_keep = [n for n, deg in nodes_by_importance[:max_nodes]]
                 G = G.subgraph(nodes_to_keep).copy()
 
-            # 搵返 backend_router.py 入面迴圈處理 nodes 嘅位置
             nodes = []
-            # 喺 backend_router.py 的 get_dynamic_graphs 內修改 loop
             for n, data in G.nodes(data=True):
-                # 1. 確定正確的 Type 同 Name
                 real_type = data.get("d1") or data.get("entity_type") or data.get("type") or "Unknown"
-                real_name = str(n) # n 通常係 "HKFRS 9"
-
-                # 2. 🌟 高級清理邏輯：唔好用 data.copy()，改為「只拿需要的」
-                # 這樣可以確保原本 GraphML 裡面那個裝著 "regulation" 的 'label' 徹底消失
-                clean_props = {}
-                for k, v in data.items():
-                    # 排除所有會干擾前端渲染的系統 Key
-                    if k not in ["label", "name", "entity_type", "type", "d1", "d0"]:
-                        clean_props[k] = v
-
+                clean_props = {k: v for k, v in data.items() if k not in ["label", "name", "entity_type", "type", "d1", "d0"]}
                 nodes.append({
-                    "id": str(n),
-                    "label": real_name,       # 🌟 Sigma 渲染引擎主要讀呢個
-                    "labels": [real_type],    # 過濾用
-                    "properties": {
-                        **clean_props,        # 只有純粹的描述、時間等數據
-                        "entity_type": real_type, # 上色用
-                        "name": real_name,
-                        "label": real_name    # 🌟 雙重保險：覆蓋 properties 內可能存在的 label
-                    },
-                    "x": np.random.uniform(-100, 100),
-                    "y": np.random.uniform(-100, 100),
-                    "size": 10 + (G.degree(n) * 2) 
+                    "id": str(n), "label": str(n), "labels": [real_type],
+                    "properties": {**clean_props, "entity_type": real_type, "name": str(n), "label": str(n)},
+                    "x": np.random.uniform(-100, 100), "y": np.random.uniform(-100, 100), "size": 10 + (G.degree(n) * 2) 
                 })
-            # 5. 轉換 Edge 格式
-            edges = []
-            for u, v, data in G.edges(data=True):
-                # 提取關係描述
-                e_description = (
-                    data.get("description") or 
-                    data.get("label") or 
-                    data.get("d8") or   # LightRAG 常見關係 ID
-                    "connected"
-                )
-                
-                edges.append({
-                    "id": f"{u}-{v}",
-                    "source": str(u),
-                    "target": str(v),
-                    "type": "arrow", # 設定連線樣式
-                    "label": e_description,
-                    "properties": data
-                })
-
-            print(f"✅ [Graph-Request] Success! Sent {len(nodes)} nodes and {len(edges)} edges.")
+            
+            edges = [{"id": f"{u}-{v}", "source": str(u), "target": str(v), "type": "arrow", "label": data.get("description") or data.get("label") or "connected", "properties": data} for u, v, data in G.edges(data=True)]
             return {"nodes": nodes, "edges": edges}
-
-        except Exception as e:
-            print(f"❌ [Graph-Request] Critical Error: {str(e)}")
-            import traceback
-            traceback.print_exc() # 輸出詳細錯誤到 Docker Log
-            return {"nodes": [], "edges": []}
+        except Exception: return {"nodes": [], "edges": []}
         
     @router.get("/documents")
     async def get_dynamic_documents(request: Request):
         ws_path = request.query_params.get("workspace")
         if not ws_path: return {"statuses": {}}
-        target_dir = str(Path("./data/rag_storage") / ws_path)
+        target_dir = str(BASE_STORAGE_PATH / ws_path)
         rag_instance = await get_rag_instance(target_dir)
         docs = await rag_instance.doc_status.get_all()
         status_groups = defaultdict(list)
-        for doc in docs:
-            status_groups[doc.get("status", "processed")].append(doc)
+        for doc in docs: status_groups[doc.get("status", "processed")].append(doc)
         return {"statuses": status_groups}
 
     @router.get("/graph/label/popular")
     async def get_dynamic_labels(request: Request, limit: int = 300):
         ws_path = request.query_params.get("workspace")
         if not ws_path: return []
-        
-        rag_instance = await get_rag_instance(ws_path)
-        entities = await rag_instance.full_entities.get_all()
-        
-        # 🌟 修正：喺 KV 儲存入面都要搵 d1 同 type
-        return list(set([
-            (e.get("entity_type") or e.get("type") or e.get("d1")) 
-            for e in entities 
-            if (e.get("entity_type") or e.get("type") or e.get("d1"))
-        ]))[:limit]
+        full_path = (BASE_STORAGE_PATH / ws_path.lstrip("/")).resolve() / "graph_chunk_entity_relation.graphml"
+        if not full_path.exists(): return []
+        try:
+            G = nx.read_graphml(full_path)
+            labels_count = defaultdict(int)
+            for n, data in G.nodes(data=True):
+                real_type = data.get("d1") or data.get("entity_type") or data.get("type")
+                if real_type and isinstance(real_type, str):
+                    for t in [t.strip() for t in real_type.split(",")]:
+                        if t: labels_count[t] += 1
+            sorted_labels = sorted(labels_count.items(), key=lambda x: x[1], reverse=True)
+            return [label for label, count in sorted_labels[:limit]]
+        except Exception: return []
 
     @router.post("/graph/entity/edit")
     async def edit_entity(request: Request, data: dict):
         ws_path = request.query_params.get("workspace")
-        if not ws_path: return {"status": "error", "message": "Missing workspace"}
-        rag_instance = await get_rag_instance(str(Path("./data/rag_storage") / ws_path))
+        if not ws_path: return {"status": "error"}
         try:
+            rag_instance = await get_rag_instance(str(BASE_STORAGE_PATH / ws_path))
             result = await rag_instance.update_entity(data["entity_name"], data["updated_data"])
             return {"status": "success", "data": result}
         except Exception as e: return {"status": "error", "message": str(e)}
@@ -468,23 +430,57 @@ def create_adapter_routes(rag, api_key=None, top_k=60):
     @router.post("/graph/relation/edit")
     async def edit_relation(request: Request, data: dict):
         ws_path = request.query_params.get("workspace")
-        if not ws_path: return {"status": "error", "message": "Missing workspace"}
-        rag_instance = await get_rag_instance(str(Path("./data/rag_storage") / ws_path))
+        if not ws_path: return {"status": "error"}
         try:
+            rag_instance = await get_rag_instance(str(BASE_STORAGE_PATH / ws_path))
             result = await rag_instance.update_relation(data["source_id"], data["target_id"], data["updated_data"])
             return {"status": "success", "data": result}
         except Exception as e: return {"status": "error", "message": str(e)}
 
+    @router.post("/feedback/like")
+    async def save_feedback_like(request: Request):
+        try:
+            ws_path = request.query_params.get("workspace", "general")
+            payload = await request.json()
+            ws_path = payload.get("company_year", ws_path)
+            user_query, verified_answer = payload.get("query", ""), payload.get("verified_answer", "")
+            if not user_query or not verified_answer: return JSONResponse(status_code=400, content={"error": "Missing data"})
+                
+            embed_func = _get_dedicated_embedding()
+            vectors = await embed_func(texts=[user_query])
+            query_vector = vectors[0].tolist() if isinstance(vectors[0], np.ndarray) else vectors[0]
+            record_id = hashlib.md5(user_query.encode()).hexdigest()
+            
+            golden_record = {"id": record_id, "query": user_query, "answer": verified_answer, "vector": query_vector, "timestamp": time.time()}
+            feedback_dir = BASE_STORAGE_PATH / ws_path
+            feedback_dir.mkdir(parents=True, exist_ok=True)
+            golden_db_path = feedback_dir / "golden_db.jsonl"
+            
+            existing_records = []
+            if golden_db_path.exists():
+                with open(golden_db_path, "r", encoding="utf-8") as f:
+                    existing_records = [json.loads(line) for line in f if line.strip()]
+                            
+            existing_records = [r for r in existing_records if r["id"] != record_id]
+            existing_records.append(golden_record)
+            
+            with open(golden_db_path, "w", encoding="utf-8") as f:
+                for r in existing_records: f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            return {"status": "success"}
+        except Exception as e: return JSONResponse(status_code=500, content={"error": str(e)})
+
     @router.post("/query", response_model=QueryResponse, dependencies=[Depends(combined_auth)])
-    async def master_query_endpoint(request: QueryRequest):
-        ans, refs = await process_query_logic(request)
+    async def master_query_endpoint(request: Request, query_req: QueryRequest):
+        ws_path = request.query_params.get("workspace", "general")
+        ans, refs = await process_query_logic(query_req, ws_path)
         return QueryResponse(response=ans, references=refs if refs else None)
 
     @router.post("/query/stream", dependencies=[Depends(combined_auth)])
-    async def master_query_stream_endpoint(request: QueryRequest):
+    async def master_query_stream_endpoint(request: Request, query_req: QueryRequest):
+        ws_path = request.query_params.get("workspace", "general")
         async def event_generator():
             yield json.dumps({"response": "⏳ **AI 正在多庫導航並執筆分析**...\n\n---\n\n"}) + "\n"
-            task = asyncio.create_task(process_query_logic(request))
+            task = asyncio.create_task(process_query_logic(query_req, ws_path))
             while not task.done():
                 await asyncio.sleep(2.0)
                 if not task.done(): yield json.dumps({"response": "."}) + "\n"
@@ -497,33 +493,3 @@ def create_adapter_routes(rag, api_key=None, top_k=60):
         return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
     return router
-
-async def search_golden_db(new_query: str) -> Optional[str]:
-    """去黃金資料庫搵有冇相似問題"""
-    # 1. 將新問題轉 Vector
-    new_vector = await _get_dedicated_embedding()(texts=[new_query])
-    new_vec_np = np.array(new_vector[0])
-    
-    db_records = []
-    # 2. 讀取 Golden DB (模擬)
-    # db_records = _load_golden_db()
-    
-    best_match = None
-    highest_score = 0.0
-    
-    
-        
-    # 3. 計算 Cosine Similarity (相似度)
-    for record in db_records:
-        db_vec_np = np.array(record["vector"])
-        score = np.dot(new_vec_np, db_vec_np) / (norm(new_vec_np) * norm(db_vec_np))
-        
-        if score > highest_score:
-            highest_score = score
-            best_match = record
-            
-    # 🌟 設定一個極高嘅門檻 (例如 0.9)，確保問題係高度一致先當 Verified
-    if highest_score > 0.90:
-        return best_match["answer"]
-    return None
-

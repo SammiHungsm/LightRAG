@@ -109,7 +109,7 @@ async def build_financial_knowledge_graph(content_list: list, original_file_name
                 return await openai_complete_if_cache(
                     model=VISION_MODEL, prompt="", system_prompt=None, history_messages=[],
                     messages=[
-                        {"role": "system", "content": "You are an expert in financial chart analysis. Please extract stock codes, names, and exact weightings from tables or charts."},
+                        {"role": "system", "content": {"role": "system", "content": "You are an expert in financial analysis. Please extract ALL key financial metrics, line items (e.g., Revenue, Cost of Sales, Profit), years, and their specific numerical values from the given tables or charts. Structure them clearly (e.g., 'Revenue 2022: 100M'). Also extract stock codes and company names if present."},},
                         {"role": "user", "content": [
                             {"type": "text", "text": prompt},
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},

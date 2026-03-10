@@ -3,7 +3,7 @@ import Input from '@/components/ui/Input'
 import Button from '@/components/ui/Button'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { throttle } from '@/lib/utils'
-import { queryText, queryTextStream } from '@/api/lightrag'
+import { queryText, queryTextStream, verifyAndSaveQA } from '@/api/lightrag'
 import { errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { useDebounce } from '@/hooks/useDebounce'
@@ -106,7 +106,23 @@ export default function RetrievalTesting() {
   // Get current tab to determine if this tab is active (for performance optimization)
   const currentTab = useSettingsStore.use.currentTab()
   const isRetrievalTabActive = currentTab === 'retrieval'
-
+  // 🌟 處理「加入黃金庫」的邏輯
+  const handleVerifyResult = useCallback(async (userQuery: string, aiAnswer: string) => {
+    // 獲取當前選擇嘅 Workspace
+    const workspace = localStorage.getItem('SELECTED_WORKSPACE') || 'default_workspace';
+    
+    try {
+      await verifyAndSaveQA({
+        query: userQuery,
+        verified_answer: aiAnswer,
+        company_year: workspace
+      });
+      toast.success("✨ 成功加入黃金庫！下次問同一條問題會秒回！");
+    } catch (error) {
+      console.error('Verify error:', error);
+      toast.error("❌ 寫入失敗，請檢查 API 伺服器狀態。");
+    }
+  }, []);
   const [messages, setMessages] = useState<MessageWithError[]>(() => {
     try {
       const history = useSettingsStore.getState().retrievalHistory || []
@@ -731,36 +747,67 @@ CRITICAL RULES FOR REFERENCES:
                   {t('retrievePanel.retrieval.startPrompt')}
                 </div>
               ) : (
-                messages.map((message) => { // Remove unused idx
-                  // isComplete logic is now handled internally based on message.mermaidRendered
+                messages.map((message, index) => { // 🌟 1. 加返 index
                   return (
-                    <div
-                      key={message.id} // Use stable ID for key
-                      className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'} items-end gap-2`}
-                    >
-                      {message.role === 'user' && (
-                        <Button
-                          onClick={() => handleCopyMessage(message)}
-                          className="mb-2 size-6 rounded-md opacity-60 transition-opacity hover:opacity-100 shrink-0"
-                          tooltip={t('retrievePanel.chatMessage.copyTooltip')}
-                          variant="ghost"
-                          size="icon"
-                        >
-                          <CopyIcon className="size-4" />
-                        </Button>
+                    // 🌟 2. 外面包多一層 flex-col
+                    <div key={message.id} className="flex flex-col gap-1 mb-2 w-full">
+                      
+                      {/* --- 這是原本的對話泡泡與 Copy 掣 --- */}
+                      <div className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'} items-end gap-2`}>
+                        {message.role === 'user' && (
+                          <Button
+                            onClick={() => handleCopyMessage(message)}
+                            className="mb-2 size-6 rounded-md opacity-60 transition-opacity hover:opacity-100 shrink-0"
+                            tooltip={t('retrievePanel.chatMessage.copyTooltip')}
+                            variant="ghost"
+                            size="icon"
+                          >
+                            <CopyIcon className="size-4" />
+                          </Button>
+                        )}
+                        <ChatMessage message={message} isTabActive={isRetrievalTabActive} />
+                        {message.role === 'assistant' && (
+                          <Button
+                            onClick={() => handleCopyMessage(message)}
+                            className="mb-2 size-6 rounded-md opacity-60 transition-opacity hover:opacity-100 shrink-0"
+                            tooltip={t('retrievePanel.chatMessage.copyTooltip')}
+                            variant="ghost"
+                            size="icon"
+                          >
+                            <CopyIcon className="size-4" />
+                          </Button>
+                        )}
+                      </div>
+
+                      {/* 🌟 3. 這是新加的「Mark as Verified」按鈕！ */}
+                      {message.role === 'assistant' && !isLoading && (
+                        <div className="flex justify-start pl-2">
+                          <Button
+                            type="button" // 重要：防止誤觸 Form Submit
+                            onClick={() => {
+                              // 獲取上一句 (User 問題)
+                              const userQuery = index > 0 && messages[index - 1].role === 'user' 
+                                ? messages[index - 1].content 
+                                : '';
+                              // 獲取 AI 答案
+                              const aiAnswer = message.displayContent !== undefined ? message.displayContent : (message.content || '');
+                              
+                              if (userQuery) {
+                                handleVerifyResult(userQuery, aiAnswer);
+                              } else {
+                                toast.error("找不到對應的用戶問題");
+                              }
+                            }}
+                            variant="outline"
+                            size="sm"
+                            className="h-6 px-2 py-0 text-[11px] bg-yellow-50 text-yellow-700 border-yellow-300 hover:bg-yellow-200 dark:bg-yellow-900/30 dark:text-yellow-500 dark:border-yellow-700 transition-colors"
+                            tooltip="將此完美答案加入黃金庫，下次秒回！"
+                          >
+                            <span className="mr-1">👍</span> Mark as Verified
+                          </Button>
+                        </div>
                       )}
-                      <ChatMessage message={message} isTabActive={isRetrievalTabActive} />
-                      {message.role === 'assistant' && (
-                        <Button
-                          onClick={() => handleCopyMessage(message)}
-                          className="mb-2 size-6 rounded-md opacity-60 transition-opacity hover:opacity-100 shrink-0"
-                          tooltip={t('retrievePanel.chatMessage.copyTooltip')}
-                          variant="ghost"
-                          size="icon"
-                        >
-                          <CopyIcon className="size-4" />
-                        </Button>
-                      )}
+
                     </div>
                   );
                 })
@@ -770,6 +817,7 @@ CRITICAL RULES FOR REFERENCES:
           </div>
         </div>
 
+        {/* --- 下面是原本的 Form 輸入框，維持不變 --- */}
         <form
           onSubmit={handleSubmit}
           className="flex shrink-0 items-center gap-2"
@@ -778,7 +826,6 @@ CRITICAL RULES FOR REFERENCES:
           action="#"
           role="search"
         >
-          {/* Hidden submit button to ensure form meets HTML standards */}
           <input type="submit" style={{ display: 'none' }} tabIndex={-1} />
           <Button
             type="button"
@@ -807,12 +854,7 @@ CRITICAL RULES FOR REFERENCES:
                 placeholder={t('retrievePanel.retrieval.placeholder')}
                 disabled={isLoading}
                 rows={1}
-                style={{
-                  resize: 'none',
-                  height: 'auto',
-                  minHeight: '40px',
-                  maxHeight: '120px'
-                }}
+                style={{ resize: 'none', height: 'auto', minHeight: '40px', maxHeight: '120px' }}
                 onInput={(e: React.FormEvent<HTMLTextAreaElement>) => {
                   const target = e.target as HTMLTextAreaElement
                   requestAnimationFrame(() => {
@@ -835,7 +877,6 @@ CRITICAL RULES FOR REFERENCES:
                 disabled={isLoading}
               />
             )}
-            {/* Error message below input */}
             {inputError && (
               <div className="absolute left-0 top-full mt-1 text-xs text-red-500">{inputError}</div>
             )}

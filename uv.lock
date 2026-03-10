@@ -934,6 +934,21 @@ wheels = [
 ]
 
 [[package]]
+name = "dashscope"
+version = "1.25.13"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "certifi" },
+    { name = "cryptography" },
+    { name = "requests" },
+    { name = "websocket-client" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f9/35/f1fbc93189da944ea1505647dd2ae3b7f8c2688e1f8087e08ffe043d3c3e/dashscope-1.25.13-py3-none-any.whl", hash = "sha256:03e7ce41954bacc3786ec3f45d5dc01e1a8ccf2741503ce3dc9e4ce60866386e", size = 1342636, upload-time = "2026-03-03T01:55:03.866Z" },
+]
+
+[[package]]
 name = "dataclasses-json"
 version = "0.6.7"
 source = { registry = "https://pypi.org/simple" }
@@ -2665,6 +2680,7 @@ dependencies = [
     { name = "beautifulsoup4" },
     { name = "configparser" },
     { name = "croniter" },
+    { name = "dashscope" },
     { name = "docker" },
     { name = "duckduckgo-search" },
     { name = "google-api-core" },
@@ -2926,6 +2942,7 @@ requires-dist = [
     { name = "configparser" },
     { name = "configparser", marker = "extra == 'api'" },
     { name = "croniter" },
+    { name = "dashscope", specifier = ">=1.25.13" },
     { name = "datasets", marker = "extra == 'evaluation'", specifier = ">=4.3.0" },
     { name = "distro", marker = "extra == 'api'" },
     { name = "docker", specifier = ">=7.1.0" },
@@ -6656,6 +6673,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/25/6f/e1ea6dcb21da43d581284d8d5a715c2affb906aa3ed301f77f7f5ae0e7d5/wcwidth-0.3.1.tar.gz", hash = "sha256:5aedb626a9c0d941b990cfebda848d538d45c9493a3384d080aff809143bd3be", size = 233057, upload-time = "2026-01-22T22:08:25.231Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d7/9c/9d951691bf1224772f6082d3b2e8c110edfd9622627908ad75bb0f691979/wcwidth-0.3.1-py3-none-any.whl", hash = "sha256:b2d355df3ec5d51bfc973a22fb4ea9a03b12fdcbf00d0abd22a2c78b12ccc177", size = 85746, upload-time = "2026-01-22T22:08:23.564Z" },
+]
+
+[[package]]
+name = "websocket-client"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/41/aa4bf9664e4cda14c3b39865b12251e8e7d239f4cd0e3cc1b6c2ccde25c1/websocket_client-1.9.0.tar.gz", hash = "sha256:9e813624b6eb619999a97dc7958469217c3176312b3a16a4bd1bc7e08a46ec98", size = 70576, upload-time = "2025-10-07T21:16:36.495Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/34/db/b10e48aa8fff7407e67470363eac595018441cf32d5e1001567a7aeba5d2/websocket_client-1.9.0-py3-none-any.whl", hash = "sha256:af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef", size = 82616, upload-time = "2025-10-07T21:16:34.951Z" },
 ]
 
 [[package]]
