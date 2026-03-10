@@ -11,6 +11,9 @@ from collections import defaultdict
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 
+from numpy.linalg import norm
+from typing import Optional
+
 # LightRAG 核心
 from lightrag.base import QueryParam
 from lightrag.utils import logger, EmbeddingFunc
@@ -58,25 +61,26 @@ def _get_dedicated_llm():
         )
     return llm_wrapper
 
-def get_rag_instance(ws_path_from_ui: str) -> LightRAG:
-    """ws_path_from_ui 應該係例如 'financial_report/3SBio/2024'"""
+# 將原本嘅 get_rag_instance 替換成呢個 Async 版本：
+async def get_rag_instance(ws_path_from_ui: str) -> LightRAG:
     base_dir = Path("/app/data/rag_storage")
     
-    # 🌟 避免重複拼接：如果 ws_path 已經包含 base_dir 嘅名，要處理返
     if "data/rag_storage" in ws_path_from_ui:
-        # 如果傳入嚟已經係完整路徑，就直接用
         full_path = str(Path(ws_path_from_ui).absolute())
     else:
         full_path = str((base_dir / ws_path_from_ui.lstrip("/")).absolute())
     
     if full_path not in _rag_cache:
         logger.info(f"🧬 正在初始化物理路徑: {full_path}")
-        # 🌟 修正： embedding_func 要傳入 Callable 
-        _rag_cache[full_path] = LightRAG(
+        rag = LightRAG(
             working_dir=full_path,
             llm_model_func=_get_dedicated_llm(),
-            embedding_func=_get_dedicated_embedding() # 佢係一個 Callable 物件
+            embedding_func=_get_dedicated_embedding()
         )
+        # 🌟 致命 Bug 殺手：必須初始化 Storage，否則會報 NoneType Error！
+        await rag.initialize_storages()
+        _rag_cache[full_path] = rag
+        
     return _rag_cache[full_path]
 
 # ==========================================
@@ -132,7 +136,7 @@ class FinancialRAGTool(Tool):
 
         if not target_dir.exists(): return f"Error: Workspace {workspace_name} not found."
         
-        rag = get_rag_instance(str(target_dir))
+        rag = await get_rag_instance(str(target_dir))
         param = QueryParam(mode="mix", stream=False, top_k=60)
         result = await rag.aquery_llm(query, param=param)
         
@@ -145,7 +149,8 @@ class FinancialRAGTool(Tool):
 
 class PythonSandboxTool(Tool):
     name = "python_sandbox"
-    description = "執行純 Python 代碼。計算財務指標、排名、對比數據時必用。必須使用 print() 輸出結果。"
+    # 🌟 加入強烈字眼，逼 LLM 喺 Ranking 嗰陣必須用 Python
+    description = "執行純 Python 代碼。當需要對多間公司的數據進行「排序 (Sorting)」、「排名 (Ranking)」、或「數學計算」時【絕對強制使用】。嚴禁使用 LLM 自身能力進行數字排序或比大小。必須使用 print() 輸出結果。"
     parameters = {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}
 
     async def execute(self, code: str, **kwargs) -> str:
@@ -160,16 +165,61 @@ class PythonSandboxTool(Tool):
         except Exception as e:
             return f"Python Runtime Error: {str(e)}"
 
+class BatchFinancialRAGTool(Tool):
+    name = "batch_access_financial_data"
+    description = "一次性並發查詢多間公司的財務數據。當需要對比、列表或獲取多間公司數據時必須使用此工具。"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "workspace_names": {
+                "type": "array", 
+                "items": {"type": "string"},
+                "description": "公司資料夾名稱列表，例如 ['3SBio Inc._1530', 'Akeso_9926']"
+            },
+            "year": {"type": "string", "description": "財報年份，例如 '2024'"},
+            "query": {"type": "string", "description": "要查詢的問題"}
+        },
+        "required": ["workspace_names", "year", "query"]
+    }
+
+    def __init__(self, base_path: Path, refs_list: list):
+        super().__init__()
+        self.base_path = base_path
+        self.refs_list = refs_list
+
+    async def execute(self, workspace_names: list, year: str, query: str, **kwargs) -> str:
+        async def fetch_single(company: str):
+            target_dir = self.base_path / "financial_report" / company / year
+            if not target_dir.exists():
+                return f"[{company}]: 找不到 {year} 年的數據庫"
+            
+            try:
+                rag = await get_rag_instance(str(target_dir).replace("/app/data/rag_storage/", ""))
+                param = QueryParam(mode="mix", stream=False, top_k=30) # 批次查詢可稍微調低 top_k 節省時間
+                result = await rag.aquery_llm(query, param=param)
+                
+                if "references" in result.get("data", {}):
+                    self.refs_list.extend(result["data"]["references"])
+                    
+                content = result.get("llm_response", {}).get("content", "")
+                return f"--- [{company} 2024 數據] ---\n{content}\n"
+            except Exception as e:
+                return f"[{company}]: 查詢失敗 ({str(e)})"
+
+        # 🌟 核心：使用 asyncio.gather 實現真正嘅並行檢索！
+        results = await asyncio.gather(*(fetch_single(comp) for comp in workspace_names))
+        
+        return "\n".join(results)
+# ==========================================
+# 3. Agent 初始化與混合式 Prompt
+# ==========================================
 # ==========================================
 # 3. Agent 初始化與混合式 Prompt
 # ==========================================
 def _create_master_agent(collected_refs: list) -> AgentLoop:
     storage_path = Path("./data/rag_storage")
     
-    # 🌟 因為你冇 nanobot_workspace，Skills 喺 nanobot/skills 
     nanobot_root = Path("/app/nanobot") 
-    
-    # 用嚟擺 Session 嘅臨時位
     workspace_path = nanobot_root / ".workspace"
     workspace_path.mkdir(exist_ok=True)
 
@@ -180,45 +230,84 @@ def _create_master_agent(collected_refs: list) -> AgentLoop:
     )
     
     agent = AgentLoop(bus=MessageBus(), provider=provider, workspace=workspace_path, max_iterations=100)
-    
-    # 🌟 修正：Loader 去 /app/nanobot 搵 skills 
     loader = SkillsLoader(workspace=nanobot_root)
     skills_context = loader.load_skills_for_context(loader.get_always_skills())
 
-    # 🌟 混合式強效 Prompt：保留嚴格約束 + 增加導航指引
+    # 🌟 將你的三大 Concept 注入大腦
     agent.system_prompt = f"""
-    You are a Senior Financial Research Agent tailored for MULTI-WORKSPACE internal data analysis.
+    You are a Senior Financial Research Agent.
+
+    CRITICAL CONCEPTS & CONSTRAINTS:
+    1. **DIRECT EXTRACTION (直接提取)**: If the user asks for specific figures (e.g., exact revenue, percentage of shareholding, list of directors, debt amounts) from a single company's report, use `access_financial_data` to retrieve and output the exact text/numbers. Do not over-complicate.
     
-    STRICT CONSTRAINTS:
-    1. **INTERNAL DATA ONLY**: You must search facts using `access_financial_data`. NEVER use your pre-trained knowledge.
-    2. **ZERO HALLUCINATION**: Answers MUST be 100% based on retrieved chunks. If no data, state "內部資料庫中沒有相關資訊".
-    3. **DATA ANALYSIS & MATH**: You MUST use `python_sandbox` for calculations. NEVER do mental math.
+    2. **CROSS-COMPANY (跨庫檢索)**: If the query involves multiple companies or an index (e.g., "all biotech companies"), you MUST use `batch_access_financial_data` exactly ONCE to cross-query all workspaces concurrently. Do NOT loop single queries.
     
+    3. **RANKING & SORTING (腳本排序)**: You are FORBIDDEN to mentally rank, sort, or calculate numbers. If the user asks to "rank by revenue", "sort the list", or "find the highest/lowest", you MUST:
+       - First, fetch the raw data.
+       - Second, pass the raw data into `python_sandbox` to write a sorting script.
+       - Third, use the script's `print()` output as your final answer.
+       
+    4. **ZERO HALLUCINATION**: Answers MUST be 100% based on retrieved chunks.
+
     NAVIGATION RULES:
-    - First, use `list_available_workspaces` to see which companies or indexes are available.
-    - Use `access_financial_data` to hop between isolated workspaces.
+    - Always use `list_available_workspaces` first if you don't know the exact company names.
+    
+    請用專業的香港粵語回應用戶。
     
     {skills_context}
     """
     
     agent.tools.register(WorkspaceDiscoveryTool(storage_path))
     agent.tools.register(FinancialRAGTool(storage_path, collected_refs))
+    agent.tools.register(BatchFinancialRAGTool(storage_path, collected_refs))
     agent.tools.register(PythonSandboxTool())
     return agent
 
+import time
+
+# ==========================================
+# 處理核心 Query 邏輯
+# ==========================================
 async def process_query_logic(request: QueryRequest) -> Tuple[str, list]:
+    # 🌟 [進階功能預留位] 第一關：Golden QA 攔截器
+    # 如果你之後實作咗 Golden DB，可以喺度 Call:
+    # verified_answer = await search_golden_db(request.query)
+    # if verified_answer:
+    #     return f"✨ **[已核實答案 Verified]**\n\n{verified_answer}", []
+
+    # 🐢 第二關：常規 Agent 查詢 (Slow Path)
     collected_refs = []
     agent = _create_master_agent(collected_refs)
-    history = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in request.conversation_history[-3:]]) if request.conversation_history else ""
-    ans = await agent.process_direct(content=f"HISTORY:\n{history}\n\nUSER REQUEST: {request.query}", channel="webui", chat_id="master_session")
     
-    # 引用去重
+    # 1. 嚴格限制歷史記錄 (Context Window Management)
+    # 建議只保留最後 1-2 條對話，避免過長嘅歷史令 Agent「精神恍惚」忘記 System Prompt
+    history = ""
+    if request.conversation_history:
+        recent_msgs = request.conversation_history[-1:] # 只拎最後一次對話做 Context
+        history = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in recent_msgs])
+        
+    # 2. 🌟 終極洗腦大法：動態生成 chat_id！
+    # 每次對話都是一個獨一無二的全新 Session，保證大腦完全 Clean，一定會乖乖 Call Tool
+    unique_chat_id = f"session_{int(time.time())}"
+    
+    prompt_payload = f"CONTEXT:\n{history}\n\nUSER REQUEST: {request.query}" if history else f"USER REQUEST: {request.query}"
+
+    # 3. 呼叫 Agent
+    ans = await agent.process_direct(
+        content=prompt_payload, 
+        channel="webui", 
+        chat_id=unique_chat_id  # 👈 核心修正：丟棄 "master_session"
+    )
+    
+    # 4. 引用去重 (Deduplication)
     unique_refs = []
     seen = set()
     for ref in collected_refs:
         rid = ref.get('reference_id')
         if rid and rid not in seen:
-            seen.add(rid); unique_refs.append(ref)
+            seen.add(rid)
+            unique_refs.append(ref)
+            
     return ans, unique_refs
 
 # ==========================================
@@ -344,7 +433,7 @@ def create_adapter_routes(rag, api_key=None, top_k=60):
         ws_path = request.query_params.get("workspace")
         if not ws_path: return {"statuses": {}}
         target_dir = str(Path("./data/rag_storage") / ws_path)
-        rag_instance = get_rag_instance(target_dir)
+        rag_instance = await get_rag_instance(target_dir)
         docs = await rag_instance.doc_status.get_all()
         status_groups = defaultdict(list)
         for doc in docs:
@@ -356,7 +445,7 @@ def create_adapter_routes(rag, api_key=None, top_k=60):
         ws_path = request.query_params.get("workspace")
         if not ws_path: return []
         
-        rag_instance = get_rag_instance(ws_path)
+        rag_instance = await get_rag_instance(ws_path)
         entities = await rag_instance.full_entities.get_all()
         
         # 🌟 修正：喺 KV 儲存入面都要搵 d1 同 type
@@ -370,7 +459,7 @@ def create_adapter_routes(rag, api_key=None, top_k=60):
     async def edit_entity(request: Request, data: dict):
         ws_path = request.query_params.get("workspace")
         if not ws_path: return {"status": "error", "message": "Missing workspace"}
-        rag_instance = get_rag_instance(str(Path("./data/rag_storage") / ws_path))
+        rag_instance = await get_rag_instance(str(Path("./data/rag_storage") / ws_path))
         try:
             result = await rag_instance.update_entity(data["entity_name"], data["updated_data"])
             return {"status": "success", "data": result}
@@ -380,7 +469,7 @@ def create_adapter_routes(rag, api_key=None, top_k=60):
     async def edit_relation(request: Request, data: dict):
         ws_path = request.query_params.get("workspace")
         if not ws_path: return {"status": "error", "message": "Missing workspace"}
-        rag_instance = get_rag_instance(str(Path("./data/rag_storage") / ws_path))
+        rag_instance = await get_rag_instance(str(Path("./data/rag_storage") / ws_path))
         try:
             result = await rag_instance.update_relation(data["source_id"], data["target_id"], data["updated_data"])
             return {"status": "success", "data": result}
@@ -408,3 +497,33 @@ def create_adapter_routes(rag, api_key=None, top_k=60):
         return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
     return router
+
+async def search_golden_db(new_query: str) -> Optional[str]:
+    """去黃金資料庫搵有冇相似問題"""
+    # 1. 將新問題轉 Vector
+    new_vector = await _get_dedicated_embedding()(texts=[new_query])
+    new_vec_np = np.array(new_vector[0])
+    
+    db_records = []
+    # 2. 讀取 Golden DB (模擬)
+    # db_records = _load_golden_db()
+    
+    best_match = None
+    highest_score = 0.0
+    
+    
+        
+    # 3. 計算 Cosine Similarity (相似度)
+    for record in db_records:
+        db_vec_np = np.array(record["vector"])
+        score = np.dot(new_vec_np, db_vec_np) / (norm(new_vec_np) * norm(db_vec_np))
+        
+        if score > highest_score:
+            highest_score = score
+            best_match = record
+            
+    # 🌟 設定一個極高嘅門檻 (例如 0.9)，確保問題係高度一致先當 Verified
+    if highest_score > 0.90:
+        return best_match["answer"]
+    return None
+
